@@ -21,16 +21,22 @@ import java.util.Random;
  * screen on a Canvas, runs a Choreographer-driven animation loop, handles touch
  * input and drives the game-state machine. Game rules live in {@link Board} and
  * {@link Level}; this class owns presentation, animation and flow.
+ *
+ * Robustness: onDraw, onTouchEvent and the frame loop are each wrapped so that
+ * an unexpected runtime exception can never crash the app, and all shader/canvas
+ * geometry is guarded against degenerate (zero/negative) sizes.
  */
 public class GameView extends View implements Choreographer.FrameCallback {
 
-    private enum State { MENU, MAP, PREGAME, PLAYING, ANIM, COMPLETE, FAILED, DAILY }
+    private enum State { MENU, MAP, PREGAME, PLAYING, ANIM, COMPLETE, FAILED, DAILY, STATS }
 
     // Booster ids (match Storage booster ids).
     private static final int B_NONE = -1, B_BOMB = 0, B_RAINBOW = 1, B_HAMMER = 2, B_MOVES = 3;
+    private static final String[] B_NAMES = {"BOMB", "COLOR", "HAMMER", "+5"};
+    private static final int[] B_PRICE = {120, 150, 100, 80};
 
-    private static final float COMBO_WINDOW = 2.2f;
-    private static final float POP_DUR = 0.14f;
+    private static final float COMBO_WINDOW = 2.4f;
+    private static final float POP_DUR = 0.13f;
     private static final float FALL_DUR = 0.30f;
     private static final int[] DAILY_REWARDS = {50, 100, 150, 200, 250, 300, 500};
 
@@ -60,7 +66,7 @@ public class GameView extends View implements Choreographer.FrameCallback {
     private int score, movesLeft, collected, target;
     private float displayScore;
     private int combo;
-    private float comboTimer;
+    private float comboTimer, comboFlash;
     private int armed = B_NONE;
 
     // Animation
@@ -68,6 +74,7 @@ public class GameView extends View implements Choreographer.FrameCallback {
     private float animT;
     private final List<int[]> popping = new ArrayList<int[]>();
     private final List<Integer> poppingColors = new ArrayList<Integer>();
+    private int bufR = -1, bufC = -1; // tap buffered during animation
 
     // Effects
     private final List<Effects.Particle> particles = new ArrayList<Effects.Particle>();
@@ -83,7 +90,7 @@ public class GameView extends View implements Choreographer.FrameCallback {
     // Touch tracking
     private float downX, downY, lastY;
     private boolean movedWhileDown;
-    private float transFade = 1f; // simple screen fade-in
+    private float transFade = 1f;
 
     // Loop
     private long lastNanos;
@@ -149,14 +156,34 @@ public class GameView extends View implements Choreographer.FrameCallback {
         if (dt > 0.05f) {
             dt = 0.05f;
         }
-        update(dt);
+        try {
+            update(dt);
+        } catch (Throwable t) {
+            // Never let a stray exception kill the loop; recover to a safe screen.
+            safeRecover();
+        }
         invalidate();
         Choreographer.getInstance().postFrameCallback(this);
+    }
+
+    private void safeRecover() {
+        try {
+            state = State.MENU;
+            armed = B_NONE;
+            popping.clear();
+            poppingColors.clear();
+            particles.clear();
+            floats.clear();
+        } catch (Throwable ignored) {
+        }
     }
 
     @Override
     protected void onSizeChanged(int w, int h, int ow, int oh) {
         super.onSizeChanged(w, h, ow, oh);
+        if (w <= 0 || h <= 0) {
+            return; // ignore degenerate layout passes (prevents negative shader radii)
+        }
         W = w;
         H = h;
         bgPaint = new Paint();
@@ -167,37 +194,38 @@ public class GameView extends View implements Choreographer.FrameCallback {
     }
 
     private void layoutBoard() {
+        if (W <= 0 || H <= 0) {
+            return;
+        }
         if (level == null) {
             level = new Level(selectedLevel);
         }
         int cols = level.cols, rows = level.rows;
-        float availTop = H * 0.205f;
-        float availBottom = H * 0.135f;
+        float availTop = H * 0.235f;
+        float availBottom = H * 0.14f;
         float availH = H - availTop - availBottom - dp(12);
-        cell = Math.min((W * 0.95f) / cols, availH / rows);
+        // Floor everything strictly positive so every radius stays > 0.
+        cell = Math.max(dp(8), Math.min((W * 0.95f) / cols, availH / rows));
         boardW = cell * cols;
         boardH = cell * rows;
         boardX = (W - boardW) / 2f;
-        boardY = availTop + (availH - boardH) / 2f;
-        BR = cell * 0.46f;
+        boardY = availTop + Math.max(0f, (availH - boardH) / 2f);
+        BR = Math.max(1f, cell * 0.46f);
         bubbleShader = new RadialGradient[Palette.BUBBLE.length];
         for (int i = 0; i < bubbleShader.length; i++) {
             int base = Palette.BUBBLE[i];
             bubbleShader[i] = new RadialGradient(-BR * 0.34f, -BR * 0.36f, BR * 1.35f,
-                    new int[]{Palette.lighten(base, 0.65f), base, Palette.scale(base, 0.8f)},
+                    new int[]{Palette.lighten(base, 0.7f), base, Palette.scale(base, 0.78f)},
                     new float[]{0f, 0.5f, 1f}, Shader.TileMode.CLAMP);
         }
     }
 
     private void initBgBubbles() {
         bgBubbles.clear();
-        int count = 16;
-        for (int i = 0; i < count; i++) {
+        for (int i = 0; i < 16; i++) {
             float r = dp(8) + rng.nextFloat() * dp(26);
             bgBubbles.add(new float[]{
-                    rng.nextFloat() * W,
-                    rng.nextFloat() * H,
-                    r,
+                    rng.nextFloat() * W, rng.nextFloat() * H, r,
                     -(dp(6) + rng.nextFloat() * dp(16)),
                     rng.nextInt(Palette.BUBBLE.length),
                     0.05f + rng.nextFloat() * 0.10f
@@ -213,7 +241,9 @@ public class GameView extends View implements Choreographer.FrameCallback {
         if (transFade < 1f) {
             transFade = Math.min(1f, transFade + dt * 3.5f);
         }
-        // Background bubbles drift up and wrap.
+        if (comboFlash > 0f) {
+            comboFlash = Math.max(0f, comboFlash - dt * 2.6f);
+        }
         for (float[] b : bgBubbles) {
             b[1] += b[3] * dt;
             if (b[1] + b[2] < 0) {
@@ -221,7 +251,6 @@ public class GameView extends View implements Choreographer.FrameCallback {
                 b[0] = rng.nextFloat() * W;
             }
         }
-        // Particles & floating texts.
         for (int i = particles.size() - 1; i >= 0; i--) {
             if (!particles.get(i).update(dt, dp(900))) {
                 particles.remove(i);
@@ -232,13 +261,11 @@ public class GameView extends View implements Choreographer.FrameCallback {
                 floats.remove(i);
             }
         }
-        // Score counter easing.
         if (Math.abs(displayScore - score) > 0.5f) {
             displayScore += (score - displayScore) * Math.min(1f, dt * 9f);
         } else {
             displayScore = score;
         }
-        // Combo decay.
         if (combo > 0) {
             comboTimer -= dt;
             if (comboTimer <= 0) {
@@ -256,7 +283,6 @@ public class GameView extends View implements Choreographer.FrameCallback {
     private void advanceAnim(float dt) {
         animT += dt;
         if (animPhase == 0 && animT >= POP_DUR) {
-            // Commit the clear, collapse the board, switch to the fall phase.
             for (int[] cellPos : popping) {
                 board.clearCell(cellPos[0], cellPos[1]);
             }
@@ -269,6 +295,15 @@ public class GameView extends View implements Choreographer.FrameCallback {
             poppingColors.clear();
             state = State.PLAYING;
             checkEndConditions();
+            // Apply a tap that was buffered during the animation (keeps combos flowing).
+            if (state == State.PLAYING && bufR >= 0 && board != null
+                    && board.isPoppable(bufR, bufC)) {
+                int r = bufR, c = bufC;
+                bufR = bufC = -1;
+                tryPop(r, c);
+            } else {
+                bufR = bufC = -1;
+            }
         }
     }
 
@@ -288,6 +323,7 @@ public class GameView extends View implements Choreographer.FrameCallback {
         selectedLevel = Math.max(1, lvl);
         level = new Level(selectedLevel);
         layoutBoard();
+        clearFx();
         state = State.PREGAME;
         transFade = 0f;
         sound.playClick();
@@ -304,10 +340,8 @@ public class GameView extends View implements Choreographer.FrameCallback {
         collected = 0;
         combo = 0;
         armed = B_NONE;
-        particles.clear();
-        floats.clear();
-        popping.clear();
-        poppingColors.clear();
+        bufR = bufC = -1;
+        clearFx();
         state = State.PLAYING;
         transFade = 0f;
         sound.playSwoosh();
@@ -318,6 +352,7 @@ public class GameView extends View implements Choreographer.FrameCallback {
         resultCoins = Level.coinReward(score, resultStars);
         store.recordResult(selectedLevel, resultStars);
         store.addCoins(resultCoins);
+        store.submitScore(score);
         resultBooster = -1;
         if (selectedLevel % 5 == 0) {
             resultBooster = rng.nextInt(4);
@@ -326,9 +361,9 @@ public class GameView extends View implements Choreographer.FrameCallback {
         resultT = 0;
         state = State.COMPLETE;
         sound.playWin();
-        for (int i = 0; i < 40; i++) {
-            burst(boardX + rng.nextFloat() * boardW, boardY + boardH * 0.4f,
-                    rng.nextInt(Palette.BUBBLE.length), dp(420));
+        for (int i = 0; i < 60; i++) {
+            spawnParticle(boardX + rng.nextFloat() * boardW, boardY + boardH * 0.35f,
+                    rng.nextInt(Palette.BUBBLE.length), dp(460), true);
         }
     }
 
@@ -338,71 +373,83 @@ public class GameView extends View implements Choreographer.FrameCallback {
         sound.playFail();
     }
 
-    /** Attempt to pop the connected group at a board cell. */
     private void tryPop(int r, int c) {
         List<int[]> g = board.group(r, c);
         if (g.size() >= 2) {
-            startClear(g, true);
+            startClear(g, true, false);
         } else {
             sound.playClick();
-            // little nudge of particles for feedback
-            burst(colToX(c), rowToY(r), board.colorAt(r, c), dp(120));
         }
     }
 
     private void applyBooster(int r, int c) {
         List<int[]> cells;
         if (armed == B_BOMB) {
-            cells = board.cellsInBlast(r, c, 1);
+            cells = board.cellsInBlast(r, c, 2); // 5x5 — a meaningfully "large area"
         } else if (armed == B_RAINBOW) {
             cells = board.cellsOfColor(board.colorAt(r, c));
-        } else { // hammer
+        } else {
             cells = new ArrayList<int[]>();
             cells.add(new int[]{r, c});
         }
         if (cells.isEmpty()) {
+            armed = B_NONE;
+            floatText("Nothing to pop", W / 2f, boardY + boardH / 2f, dp(16), Palette.TEXT_DIM, false);
             return;
         }
+        boolean isHammer = armed == B_HAMMER;
         store.addBooster(armed, -1);
         armed = B_NONE;
-        startClear(cells, false);
+        startClear(cells, false, isHammer);
     }
 
-    /** Shared clear+score+animate path for taps and boosters. */
-    private void startClear(List<int[]> cells, boolean costsMove) {
+    /** Shared clear+score+animate path for taps and boosters. Goal counts every popped bubble. */
+    private void startClear(List<int[]> cells, boolean costsMove, boolean singleHammer) {
         int n = cells.size();
-        combo = Math.min(10, combo + 1);
-        comboTimer = COMBO_WINDOW;
+        if (!singleHammer) {
+            combo = Math.min(10, combo + 1);
+            comboTimer = COMBO_WINDOW;
+        }
         int mult = Math.max(1, combo);
-        int gained = Level.popScore(Math.max(2, n)) * mult;
+        int gained = singleHammer ? 15 : Level.popScore(Math.max(2, n)) * mult;
         score += gained;
         if (costsMove) {
             movesLeft--;
         }
-        // Record positions/colours for the pop animation and tally collection.
+        collected += n; // every popped bubble counts toward the goal -> always winnable
+
         popping.clear();
         poppingColors.clear();
         float cx = 0, cy = 0;
-        int collectedNow = 0;
         for (int[] pos : cells) {
             int col = board.colorAt(pos[0], pos[1]);
             popping.add(new int[]{pos[0], pos[1]});
             poppingColors.add(col);
             cx += colToX(pos[1]);
             cy += rowToY(pos[0]);
-            if (col == level.targetColor) {
-                collectedNow++;
+            int count = 3 + Math.min(4, n / 3);
+            for (int k = 0; k < count; k++) {
+                spawnParticle(colToX(pos[1]), rowToY(pos[0]), col, dp(240), false);
             }
-            burst(colToX(pos[1]), rowToY(pos[0]), col, dp(260));
         }
-        collected += collectedNow;
         cx /= n;
         cy /= n;
-        floats.add(new Effects.FloatingText("+" + gained, cx, cy - BR, dp(20),
-                Palette.TEXT, 0.9f, true));
+
+        floatText("+" + gained, cx, cy - BR, dp(20), Palette.TEXT, true);
         if (combo >= 2) {
-            floats.add(new Effects.FloatingText("COMBO x" + combo, W / 2f, boardY - dp(6),
-                    dp(26), Palette.COMBO, 1.0f, true));
+            // One escalating combo callout (no duplicate static label).
+            int cc = combo >= 6 ? Palette.RED : (combo >= 4 ? Palette.STAR_ON : Palette.COMBO);
+            floats.add(new Effects.FloatingText("COMBO x" + combo, W / 2f, boardY + boardH * 0.4f,
+                    dp(22) + combo * dp(3), cc, 1.0f, true));
+            // Central burst that grows with the combo.
+            int burst = Math.min(40, 8 + n * 2 + combo * 3);
+            for (int k = 0; k < burst; k++) {
+                spawnParticle(cx, cy, poppingColors.get(k % poppingColors.size()),
+                        dp(300) + combo * dp(30), true);
+            }
+            if (combo >= 3) {
+                comboFlash = 1f;
+            }
         }
         sound.playPop(combo);
         animPhase = 0;
@@ -410,16 +457,23 @@ public class GameView extends View implements Choreographer.FrameCallback {
         state = State.ANIM;
     }
 
-    private void burst(float x, float y, int colorIdx, float speed) {
+    private void spawnParticle(float x, float y, int colorIdx, float speed, boolean sparkle) {
         int base = Palette.BUBBLE[Math.max(0, Math.min(Palette.BUBBLE.length - 1, colorIdx))];
-        int count = 5;
-        for (int i = 0; i < count; i++) {
-            double a = rng.nextDouble() * Math.PI * 2;
-            float sp = speed * (0.3f + rng.nextFloat());
-            particles.add(new Effects.Particle(x, y,
-                    (float) Math.cos(a) * sp, (float) Math.sin(a) * sp - speed * 0.3f,
-                    BR * (0.12f + rng.nextFloat() * 0.18f), base, 0.4f + rng.nextFloat() * 0.4f));
-        }
+        int color = sparkle && rng.nextInt(3) == 0 ? 0xFFFFFFFF : base;
+        double a = rng.nextDouble() * Math.PI * 2;
+        float sp = speed * (0.3f + rng.nextFloat());
+        particles.add(new Effects.Particle(x, y,
+                (float) Math.cos(a) * sp, (float) Math.sin(a) * sp - speed * 0.3f,
+                BR * (0.1f + rng.nextFloat() * 0.2f), color, 0.4f + rng.nextFloat() * 0.45f));
+    }
+
+    private void floatText(String s, float x, float y, float size, int color, boolean bold) {
+        floats.add(new Effects.FloatingText(s, x, y, size, color, 0.9f, bold));
+    }
+
+    private void clearFx() {
+        particles.clear();
+        floats.clear();
     }
 
     private float colToX(int c) {
@@ -436,35 +490,38 @@ public class GameView extends View implements Choreographer.FrameCallback {
 
     @Override
     protected void onDraw(Canvas canvas) {
-        if (W == 0) {
+        if (W == 0 || bgPaint == null) {
             return;
         }
-        if (bgPaint != null) {
+        try {
             canvas.drawRect(0, 0, W, H, bgPaint);
-        }
-        drawBgBubbles(canvas);
-        switch (state) {
-            case MENU: drawMenu(canvas); break;
-            case MAP: drawMap(canvas); break;
-            case PREGAME: drawPregame(canvas); break;
-            case PLAYING:
-            case ANIM: drawGame(canvas); break;
-            case COMPLETE: drawGame(canvas); drawComplete(canvas); break;
-            case FAILED: drawGame(canvas); drawFailed(canvas); break;
-            case DAILY: drawDaily(canvas); break;
-        }
-        drawParticles(canvas);
-        drawFloats(canvas);
-        if (transFade < 1f) {
-            p.setStyle(Paint.Style.FILL);
-            p.setColor(Palette.withAlpha(Palette.BG_TOP, (int) (255 * (1f - transFade))));
-            canvas.drawRect(0, 0, W, H, p);
+            drawBgBubbles(canvas);
+            switch (state) {
+                case MENU: drawMenu(canvas); break;
+                case MAP: drawMap(canvas); break;
+                case PREGAME: drawPregame(canvas); break;
+                case PLAYING:
+                case ANIM: drawGame(canvas); break;
+                case COMPLETE: drawGame(canvas); drawComplete(canvas); break;
+                case FAILED: drawGame(canvas); drawFailed(canvas); break;
+                case DAILY: drawDaily(canvas); break;
+                case STATS: drawStats(canvas); break;
+            }
+            drawParticles(canvas);
+            drawFloats(canvas);
+            if (transFade < 1f) {
+                p.setStyle(Paint.Style.FILL);
+                p.setColor(Palette.withAlpha(Palette.BG_TOP, (int) (255 * (1f - transFade))));
+                canvas.drawRect(0, 0, W, H, p);
+            }
+        } catch (Throwable t) {
+            safeRecover();
         }
     }
 
     private void drawBgBubbles(Canvas canvas) {
+        p.setStyle(Paint.Style.FILL);
         for (float[] b : bgBubbles) {
-            p.setStyle(Paint.Style.FILL);
             p.setColor(Palette.withAlpha(Palette.BUBBLE[(int) b[4]], (int) (b[5] * 255)));
             canvas.drawCircle(b[0], b[1], b[2], p);
         }
@@ -476,23 +533,24 @@ public class GameView extends View implements Choreographer.FrameCallback {
         drawTopCoins(canvas);
         float cy = H * 0.30f;
         drawLogo(canvas, W / 2f, cy);
-        text(canvas, "Pop Colors. Clear Stress.", W / 2f, cy + dp(70), dp(15),
+        text(canvas, "Pop Colors. Clear Stress.", W / 2f, cy + dp(72), dp(15),
                 Palette.TEXT_DIM, false, Paint.Align.CENTER);
 
         RectF play = menuPlay();
         drawButton(canvas, play, "PLAY", Palette.GREEN, Palette.GREEN_DK, dp(26));
+        text(canvas, "LEVEL " + store.unlockedLevel() + "   •   ★ " + store.totalStars(),
+                W / 2f, play.top - dp(22), dp(15), Palette.TEXT, true, Paint.Align.CENTER);
 
-        // Three round buttons.
-        RectF daily = menuDaily(), map = menuMap(), snd = menuSound();
+        RectF daily = menuDaily(), stats = menuStats(), snd = menuSound();
         drawRoundIcon(canvas, daily, Palette.GOLD, Palette.GOLD_DK);
         drawGiftIcon(canvas, daily.centerX(), daily.centerY(), dp(16));
-        drawRoundIcon(canvas, map, Palette.BLUE, Palette.BLUE_DK);
-        drawTrophyIcon(canvas, map.centerX(), map.centerY(), dp(16));
+        drawRoundIcon(canvas, stats, Palette.BLUE, Palette.BLUE_DK);
+        drawTrophyIcon(canvas, stats.centerX(), stats.centerY(), dp(16));
         drawRoundIcon(canvas, snd, Palette.PURPLE, Palette.PURPLE_DK);
         drawSoundIcon(canvas, snd.centerX(), snd.centerY(), dp(15), store.soundOn());
-
-        text(canvas, "LEVEL " + store.unlockedLevel() + "  •  ★ " + store.totalStars(),
-                W / 2f, play.top - dp(22), dp(15), Palette.TEXT, true, Paint.Align.CENTER);
+        text(canvas, "DAILY", daily.centerX(), daily.bottom + dp(18), dp(11), Palette.TEXT_DIM, true, Paint.Align.CENTER);
+        text(canvas, "STATS", stats.centerX(), stats.bottom + dp(18), dp(11), Palette.TEXT_DIM, true, Paint.Align.CENTER);
+        text(canvas, "SOUND", snd.centerX(), snd.bottom + dp(18), dp(11), Palette.TEXT_DIM, true, Paint.Align.CENTER);
     }
 
     private void drawLogo(Canvas canvas, float cx, float cy) {
@@ -533,8 +591,7 @@ public class GameView extends View implements Choreographer.FrameCallback {
     }
 
     private float nodeY(int index) {
-        // index 0 (level 1) at top; grows downward; minus scroll.
-        return dp(120) + index * nodeGap() - mapScroll;
+        return dp(130) + index * nodeGap() - mapScroll;
     }
 
     private float nodeX(int index) {
@@ -542,16 +599,15 @@ public class GameView extends View implements Choreographer.FrameCallback {
     }
 
     private int mapNodeCount() {
-        return store.unlockedLevel() + 1;
+        return store.unlockedLevel() + 8; // show a generous run of upcoming (locked) levels
     }
 
     private void drawMap(Canvas canvas) {
         int count = mapNodeCount();
-        mapScrollMax = Math.max(0, dp(120) + (count - 1) * nodeGap() + dp(120) - H);
+        mapScrollMax = Math.max(0, dp(130) + (count - 1) * nodeGap() + dp(120) - H);
 
         text(canvas, "SELECT LEVEL", W / 2f, dp(46), dp(22), Palette.TEXT, true, Paint.Align.CENTER);
 
-        // Path lines.
         p.setStyle(Paint.Style.STROKE);
         p.setStrokeWidth(dp(6));
         p.setColor(0x33FFFFFF);
@@ -576,7 +632,6 @@ public class GameView extends View implements Choreographer.FrameCallback {
             }
             boolean locked = lvl > unlocked;
             float r = dp(30);
-            // shadow
             p.setColor(0x44000000);
             canvas.drawCircle(x, y + dp(4), r, p);
             if (locked) {
@@ -589,8 +644,7 @@ public class GameView extends View implements Choreographer.FrameCallback {
                 canvas.drawCircle(x, y, r, p);
                 p.setColor(Palette.lighten(col, 0.5f));
                 canvas.drawCircle(x - r * 0.28f, y - r * 0.30f, r * 0.32f, p);
-                text(canvas, Integer.toString(lvl), x, y + dp(7), dp(20), Palette.TEXT, true,
-                        Paint.Align.CENTER);
+                text(canvas, Integer.toString(lvl), x, y + dp(7), dp(20), Palette.TEXT, true, Paint.Align.CENTER);
                 int st = store.stars(lvl);
                 for (int s = 0; s < 3; s++) {
                     drawStar(canvas, x - dp(16) + s * dp(16), y + r + dp(12), dp(7),
@@ -605,41 +659,49 @@ public class GameView extends View implements Choreographer.FrameCallback {
         drawTopCoins(canvas);
     }
 
-    // ---- PREGAME -------------------------------------------------------
+    // ---- PREGAME (with booster shop) ----------------------------------
+
+    private RectF pregameCard() {
+        return new RectF(W * 0.1f, H * 0.16f, W * 0.9f, H * 0.84f);
+    }
+
+    private RectF[] pregameBoosterSlots() {
+        RectF card = pregameCard();
+        float by = card.top + card.height() * 0.62f;
+        float spacing = (card.width() - dp(40)) / 4f;
+        RectF[] out = new RectF[4];
+        for (int i = 0; i < 4; i++) {
+            float bx = card.left + dp(20) + spacing * i + spacing / 2f;
+            out[i] = new RectF(bx - dp(28), by - dp(28), bx + dp(28), by + dp(28));
+        }
+        return out;
+    }
 
     private void drawPregame(Canvas canvas) {
         drawTopCoins(canvas);
-        RectF card = new RectF(W * 0.1f, H * 0.18f, W * 0.9f, H * 0.82f);
+        RectF card = pregameCard();
         drawPanel(canvas, card, dp(28));
 
-        text(canvas, "LEVEL " + selectedLevel, W / 2f, card.top + dp(58), dp(34),
-                Palette.TEXT, true, Paint.Align.CENTER);
-
-        // Goal.
-        text(canvas, "GOAL", W / 2f, card.top + dp(108), dp(15), Palette.TEXT_DIM, true,
-                Paint.Align.CENTER);
-        float gy = card.top + dp(160);
-        drawBubble(canvas, W / 2f - dp(46), gy, dp(26), level.targetColor, 255);
-        text(canvas, "x " + level.target, W / 2f + dp(34), gy + dp(11), dp(34),
-                Palette.TEXT, true, Paint.Align.CENTER);
-
-        // Moves & colours stats.
+        text(canvas, "LEVEL " + selectedLevel, W / 2f, card.top + dp(56), dp(34), Palette.TEXT, true, Paint.Align.CENTER);
+        text(canvas, "GOAL", W / 2f, card.top + dp(104), dp(14), Palette.TEXT_DIM, true, Paint.Align.CENTER);
+        float gy = card.top + dp(150);
+        drawBubble(canvas, W / 2f - dp(52), gy, dp(24), level.accentColor, 255);
+        text(canvas, "Clear " + level.target, W / 2f + dp(40), gy + dp(10), dp(28), Palette.TEXT, true, Paint.Align.CENTER);
         text(canvas, "Moves: " + level.moves + "      Colors: " + level.numColors,
-                W / 2f, gy + dp(58), dp(16), Palette.TEXT_DIM, false, Paint.Align.CENTER);
+                W / 2f, gy + dp(46), dp(15), Palette.TEXT_DIM, false, Paint.Align.CENTER);
 
-        // Owned boosters row.
-        text(canvas, "YOUR BOOSTERS", W / 2f, gy + dp(104), dp(14), Palette.TEXT_DIM, true,
-                Paint.Align.CENTER);
-        float by = gy + dp(150);
-        float spacing = (card.width() - dp(60)) / 4f;
+        text(canvas, "BOOSTERS  (tap to buy)", W / 2f, card.top + card.height() * 0.50f, dp(13),
+                Palette.TEXT_DIM, true, Paint.Align.CENTER);
+        RectF[] slots = pregameBoosterSlots();
         for (int i = 0; i < 4; i++) {
-            float bx = card.left + dp(30) + spacing * i + spacing / 2f;
-            RectF slot = new RectF(bx - dp(28), by - dp(28), bx + dp(28), by + dp(28));
-            drawBoosterButton(canvas, slot, i, store.booster(i), false);
+            drawBoosterButton(canvas, slots[i], i, store.booster(i), false);
+            text(canvas, B_NAMES[i], slots[i].centerX(), slots[i].bottom + dp(14), dp(9), Palette.TEXT_DIM, true, Paint.Align.CENTER);
+            drawCoin(canvas, slots[i].centerX() - dp(14), slots[i].bottom + dp(30), dp(8));
+            text(canvas, Integer.toString(B_PRICE[i]), slots[i].centerX() + dp(4), slots[i].bottom + dp(34), dp(12),
+                    Palette.GOLD, true, Paint.Align.CENTER);
         }
 
-        RectF play = pregamePlay();
-        drawButton(canvas, play, "PLAY", Palette.GREEN, Palette.GREEN_DK, dp(24));
+        drawButton(canvas, pregamePlay(), "PLAY", Palette.GREEN, Palette.GREEN_DK, dp(24));
         RectF back = backBtn();
         drawRoundIcon(canvas, back, Palette.CARD, Palette.CARD_EDGE);
         drawBackArrow(canvas, back.centerX(), back.centerY(), dp(13));
@@ -648,55 +710,57 @@ public class GameView extends View implements Choreographer.FrameCallback {
     // ---- GAME ----------------------------------------------------------
 
     private void drawGame(Canvas canvas) {
-        // Top HUD.
-        float top = dp(14);
         RectF pause = backBtn();
         drawRoundIcon(canvas, pause, Palette.CARD, Palette.CARD_EDGE);
         drawPauseIcon(canvas, pause.centerX(), pause.centerY(), dp(11));
         drawTopCoins(canvas);
 
-        // Stat pills: MOVES (left), TARGET (center), SCORE (right)
-        float pillY = H * 0.085f;
-        // Moves
-        text(canvas, "MOVES", W * 0.16f, pillY, dp(13), Palette.TEXT_DIM, true, Paint.Align.CENTER);
-        text(canvas, Integer.toString(Math.max(0, movesLeft)), W * 0.16f, pillY + dp(30), dp(30),
+        // Stat row sits BELOW the coin pill and pause button to avoid overlap.
+        float labelY = H * 0.115f;
+        float valueY = labelY + dp(32);
+        // MOVES (left)
+        float mx = W * 0.22f;
+        text(canvas, "MOVES", mx, labelY, dp(13), Palette.TEXT_DIM, true, Paint.Align.CENTER);
+        text(canvas, Integer.toString(Math.max(0, movesLeft)), mx, valueY, dp(30),
                 movesLeft <= 5 ? Palette.RED : Palette.TEXT, true, Paint.Align.CENTER);
-        // Target
-        text(canvas, "TARGET", W * 0.5f, pillY, dp(13), Palette.TEXT_DIM, true, Paint.Align.CENTER);
-        drawBubble(canvas, W * 0.5f - dp(34), pillY + dp(22), dp(15), level.targetColor, 255);
-        text(canvas, Math.min(collected, target) + "/" + target, W * 0.5f + dp(20), pillY + dp(30),
-                dp(26), collected >= target ? Palette.GREEN : Palette.TEXT, true, Paint.Align.CENTER);
-        // Score
-        text(canvas, "SCORE", W * 0.84f, pillY, dp(13), Palette.TEXT_DIM, true, Paint.Align.CENTER);
-        text(canvas, comma((int) displayScore), W * 0.84f, pillY + dp(30), dp(24), Palette.GOLD,
-                true, Paint.Align.CENTER);
+        // TARGET (center)
+        text(canvas, "GOAL", W * 0.5f, labelY, dp(13), Palette.TEXT_DIM, true, Paint.Align.CENTER);
+        drawBubble(canvas, W * 0.5f - dp(36), valueY - dp(8), dp(14), level.accentColor, 255);
+        text(canvas, Math.min(collected, target) + "/" + target, W * 0.5f + dp(18), valueY, dp(25),
+                collected >= target ? Palette.GREEN : Palette.TEXT, true, Paint.Align.CENTER);
+        // SCORE (right, anchored & auto-shrunk so it never overflows)
+        text(canvas, "SCORE", W - dp(18), labelY, dp(13), Palette.TEXT_DIM, true, Paint.Align.RIGHT);
+        textRight(canvas, comma((int) displayScore), W - dp(18), valueY, dp(24), W * 0.30f, Palette.GOLD);
 
-        // Combo meter.
+        // Combo meter (single presentation; the callout is the floating text).
         if (combo >= 2) {
             float frac = Math.max(0f, comboTimer / COMBO_WINDOW);
-            float barW = W * 0.5f, bx = (W - barW) / 2f, byy = boardY - dp(16);
+            float barW = W * 0.5f, bx = (W - barW) / 2f, byy = boardY - dp(14);
             p.setStyle(Paint.Style.FILL);
             p.setColor(0x33000000);
             canvas.drawRoundRect(new RectF(bx, byy, bx + barW, byy + dp(8)), dp(4), dp(4), p);
-            p.setColor(Palette.COMBO);
+            p.setColor(combo >= 6 ? Palette.RED : (combo >= 4 ? Palette.STAR_ON : Palette.COMBO));
             canvas.drawRoundRect(new RectF(bx, byy, bx + barW * frac, byy + dp(8)), dp(4), dp(4), p);
-            text(canvas, "COMBO x" + combo, W / 2f, byy - dp(6), dp(16), Palette.COMBO, true,
-                    Paint.Align.CENTER);
         }
 
         drawBoard(canvas);
-        drawBoosterBar(canvas);
 
+        // Combo flash over the board.
+        if (comboFlash > 0f) {
+            p.setStyle(Paint.Style.FILL);
+            p.setColor(Palette.withAlpha(0xFFFFFFFF, (int) (60 * comboFlash)));
+            canvas.drawRoundRect(new RectF(boardX, boardY, boardX + boardW, boardY + boardH), dp(16), dp(16), p);
+        }
+
+        drawBoosterBar(canvas);
         if (armed != B_NONE) {
-            text(canvas, "Tap a bubble to use booster", W / 2f, boardY + boardH + dp(4), dp(14),
+            text(canvas, "Tap a bubble to use booster", W / 2f, boardY + boardH + dp(6), dp(14),
                     Palette.COMBO, true, Paint.Align.CENTER);
         }
     }
 
     private void drawBoard(Canvas canvas) {
-        // Board backing panel.
-        RectF bg = new RectF(boardX - dp(8), boardY - dp(8),
-                boardX + boardW + dp(8), boardY + boardH + dp(8));
+        RectF bg = new RectF(boardX - dp(8), boardY - dp(8), boardX + boardW + dp(8), boardY + boardH + dp(8));
         p.setStyle(Paint.Style.FILL);
         p.setColor(Palette.BOARD_BG);
         canvas.drawRoundRect(bg, dp(16), dp(16), p);
@@ -706,7 +770,7 @@ public class GameView extends View implements Choreographer.FrameCallback {
         }
         boolean fall = (state == State.ANIM && animPhase == 1);
         boolean popPhase = (state == State.ANIM && animPhase == 0);
-        float fallP = easeOutCubic(Math.min(1f, animT / FALL_DUR));
+        float fallP = easeOutBack(Math.min(1f, animT / FALL_DUR)); // slight landing bounce
 
         for (int r = 0; r < board.rows; r++) {
             for (int c = 0; c < board.cols; c++) {
@@ -715,24 +779,16 @@ public class GameView extends View implements Choreographer.FrameCallback {
                     continue;
                 }
                 float x = colToX(c);
-                float y;
-                if (fall) {
-                    int src = board.srcRowOf(r, c);
-                    y = lerp(rowToY(src), rowToY(r), fallP);
-                } else {
-                    y = rowToY(r);
-                }
+                float y = fall ? lerp(rowToY(board.srcRowOf(r, c)), rowToY(r), fallP) : rowToY(r);
                 drawBoardBubble(canvas, x, y, col, 1f, 255);
             }
         }
-        // Popping cells shrinking on top during pop phase.
         if (popPhase) {
             float s = 1f - easeOutCubic(Math.min(1f, animT / POP_DUR));
             for (int i = 0; i < popping.size(); i++) {
                 int[] pos = popping.get(i);
-                int col = poppingColors.get(i);
-                drawBoardBubble(canvas, colToX(pos[1]), rowToY(pos[0]), col, Math.max(0.01f, s),
-                        (int) (255 * s));
+                drawBoardBubble(canvas, colToX(pos[1]), rowToY(pos[0]), poppingColors.get(i),
+                        Math.max(0.01f, s), (int) (255 * s));
             }
         }
     }
@@ -741,6 +797,8 @@ public class GameView extends View implements Choreographer.FrameCallback {
         RectF[] slots = boosterBar();
         for (int i = 0; i < 4; i++) {
             drawBoosterButton(canvas, slots[i], i, store.booster(i), armed == i);
+            text(canvas, B_NAMES[i], slots[i].centerX(), slots[i].bottom + dp(13), dp(9),
+                    armed == i ? Palette.COMBO : Palette.TEXT_DIM, true, Paint.Align.CENTER);
         }
     }
 
@@ -750,33 +808,33 @@ public class GameView extends View implements Choreographer.FrameCallback {
         dimScreen(canvas);
         RectF card = new RectF(W * 0.12f, H * 0.2f, W * 0.88f, H * 0.8f);
         drawPanel(canvas, card, dp(28));
-        text(canvas, "LEVEL " + selectedLevel, W / 2f, card.top + dp(46), dp(20),
-                Palette.TEXT_DIM, true, Paint.Align.CENTER);
-        text(canvas, "COMPLETE!", W / 2f, card.top + dp(84), dp(34), Palette.GREEN, true,
-                Paint.Align.CENTER);
+        text(canvas, "LEVEL " + selectedLevel, W / 2f, card.top + dp(46), dp(20), Palette.TEXT_DIM, true, Paint.Align.CENTER);
+        text(canvas, "COMPLETE!", W / 2f, card.top + dp(84), dp(34), Palette.GREEN, true, Paint.Align.CENTER);
 
-        // Stars reveal.
         float sy = card.top + dp(150);
         for (int i = 0; i < 3; i++) {
-            float appear = resultT - 0.25f - i * 0.22f;
-            float sc = appear <= 0 ? 0f : Math.min(1f, easeOutBack(Math.min(1f, appear / 0.35f)));
             boolean on = i < resultStars;
-            float r = dp(30) * (on ? sc : 1f);
             float x = W / 2f + (i - 1) * dp(70);
-            drawStar(canvas, x, sy - (on ? (1 - sc) * dp(20) : 0), Math.max(dp(14), r),
-                    on ? Palette.STAR_ON : Palette.STAR_OFF);
+            if (on) {
+                float appear = resultT - 0.25f - i * 0.22f;
+                if (appear <= 0) {
+                    continue; // truly pops in from nothing
+                }
+                float sc = Math.min(1f, easeOutBack(Math.min(1f, appear / 0.35f)));
+                drawStar(canvas, x, sy - (1 - sc) * dp(16), dp(30) * sc, Palette.STAR_ON);
+            } else {
+                drawStar(canvas, x, sy, dp(22), Palette.STAR_OFF);
+            }
         }
 
-        text(canvas, "SCORE", W / 2f, sy + dp(80), dp(15), Palette.TEXT_DIM, true,
-                Paint.Align.CENTER);
-        text(canvas, comma(score), W / 2f, sy + dp(118), dp(36), Palette.TEXT, true,
-                Paint.Align.CENTER);
+        text(canvas, "SCORE", W / 2f, sy + dp(80), dp(15), Palette.TEXT_DIM, true, Paint.Align.CENTER);
+        float sp = Math.min(1f, Math.max(0f, (resultT - 0.6f) / 0.7f));
+        text(canvas, comma((int) (score * sp)), W / 2f, sy + dp(118), dp(36), Palette.TEXT, true, Paint.Align.CENTER);
 
         drawCoin(canvas, W / 2f - dp(40), sy + dp(158), dp(16));
-        text(canvas, "+" + resultCoins, W / 2f + dp(6), sy + dp(166), dp(26), Palette.GOLD, true,
-                Paint.Align.CENTER);
+        text(canvas, "+" + resultCoins, W / 2f + dp(6), sy + dp(166), dp(26), Palette.GOLD, true, Paint.Align.CENTER);
         if (resultBooster >= 0) {
-            text(canvas, "Bonus booster unlocked!", W / 2f, sy + dp(196), dp(14),
+            text(canvas, "Bonus " + B_NAMES[resultBooster] + " booster!", W / 2f, sy + dp(196), dp(14),
                     Palette.COMBO, true, Paint.Align.CENTER);
         }
 
@@ -786,17 +844,20 @@ public class GameView extends View implements Choreographer.FrameCallback {
 
     private void drawFailed(Canvas canvas) {
         dimScreen(canvas);
-        RectF card = new RectF(W * 0.12f, H * 0.24f, W * 0.88f, H * 0.76f);
+        RectF card = new RectF(W * 0.12f, H * 0.22f, W * 0.88f, H * 0.78f);
         drawPanel(canvas, card, dp(28));
-        text(canvas, "OUT OF MOVES", W / 2f, card.top + dp(70), dp(30), Palette.RED, true,
-                Paint.Align.CENTER);
-        text(canvas, "You collected", W / 2f, card.top + dp(120), dp(16), Palette.TEXT_DIM, false,
-                Paint.Align.CENTER);
-        drawBubble(canvas, W / 2f - dp(34), card.top + dp(168), dp(22), level.targetColor, 255);
-        text(canvas, collected + " / " + target, W / 2f + dp(28), card.top + dp(176), dp(30),
-                Palette.TEXT, true, Paint.Align.CENTER);
-        drawButton(canvas, failedRetry(), "RETRY", Palette.GREEN, Palette.GREEN_DK, dp(24));
-        drawButton(canvas, failedHome(), "MAP", Palette.BLUE, Palette.BLUE_DK, dp(20));
+        text(canvas, "OUT OF MOVES", W / 2f, card.top + dp(64), dp(30), Palette.RED, true, Paint.Align.CENTER);
+        text(canvas, "You cleared", W / 2f, card.top + dp(108), dp(16), Palette.TEXT_DIM, false, Paint.Align.CENTER);
+        drawBubble(canvas, W / 2f - dp(34), card.top + dp(152), dp(20), level.accentColor, 255);
+        text(canvas, collected + " / " + target, W / 2f + dp(26), card.top + dp(160), dp(28), Palette.TEXT, true, Paint.Align.CENTER);
+
+        boolean canRescue = store.booster(B_MOVES) > 0 || store.coins() >= B_PRICE[B_MOVES];
+        if (canRescue) {
+            String lbl = store.booster(B_MOVES) > 0 ? "CONTINUE  +5 MOVES" : "CONTINUE  (" + B_PRICE[B_MOVES] + "¢)";
+            drawButton(canvas, failedContinue(), lbl, Palette.GOLD, Palette.GOLD_DK, dp(18));
+        }
+        drawButton(canvas, failedRetry(), "RETRY", Palette.GREEN, Palette.GREEN_DK, dp(22));
+        drawButton(canvas, failedHome(), "MAP", Palette.BLUE, Palette.BLUE_DK, dp(18));
     }
 
     // ---- DAILY ---------------------------------------------------------
@@ -817,10 +878,8 @@ public class GameView extends View implements Choreographer.FrameCallback {
         drawTopCoins(canvas);
         RectF card = new RectF(W * 0.08f, H * 0.16f, W * 0.92f, H * 0.84f);
         drawPanel(canvas, card, dp(28));
-        text(canvas, "DAILY REWARD", W / 2f, card.top + dp(54), dp(28), Palette.TEXT, true,
-                Paint.Align.CENTER);
-        text(canvas, "Streak: " + store.dailyStreak() + " days", W / 2f, card.top + dp(86), dp(15),
-                Palette.TEXT_DIM, false, Paint.Align.CENTER);
+        text(canvas, "DAILY REWARD", W / 2f, card.top + dp(54), dp(28), Palette.TEXT, true, Paint.Align.CENTER);
+        text(canvas, "Streak: " + store.dailyStreak() + " days", W / 2f, card.top + dp(86), dp(15), Palette.TEXT_DIM, false, Paint.Align.CENTER);
 
         int cur = dailyIndex();
         boolean claimable = dailyClaimable();
@@ -830,13 +889,11 @@ public class GameView extends View implements Choreographer.FrameCallback {
         for (int i = 0; i < 7; i++) {
             int row = i / 3, coli = i % 3;
             boolean isBig = (i == 6);
-            float x = card.left + dp(30) + (isBig ? cellW : cellW * coli);
-            float w = isBig ? cellW * 3 : cellW - dp(10);
+            float x = card.left + dp(30) + cellW * coli;
             float y = gridTop + row * (cellH + dp(12));
-            RectF cellRect = new RectF(x, y, x + (isBig ? cellW : w), y + cellH);
-            if (isBig) {
-                cellRect = new RectF(card.left + dp(30), y, card.right - dp(30), y + cellH);
-            }
+            RectF cellRect = isBig
+                    ? new RectF(card.left + dp(30), y, card.right - dp(30), y + cellH)
+                    : new RectF(x, y, x + cellW - dp(10), y + cellH);
             boolean claimed = i < cur;
             boolean current = claimable && i == cur;
             p.setStyle(Paint.Style.FILL);
@@ -846,11 +903,14 @@ public class GameView extends View implements Choreographer.FrameCallback {
                     current ? Palette.CARD_EDGE : Palette.TEXT_DIM, true, Paint.Align.CENTER);
             if (claimed) {
                 drawCheck(canvas, cellRect.centerX(), cellRect.centerY() + dp(8), dp(14));
+            } else if (isBig) {
+                drawChest(canvas, cellRect.centerX() - dp(2), cellRect.centerY() + dp(10), dp(16));
+                text(canvas, "+" + DAILY_REWARDS[i] + " +BONUS", cellRect.centerX() + dp(34), cellRect.centerY() + dp(14),
+                        dp(13), current ? Palette.CARD_EDGE : Palette.TEXT, true, Paint.Align.CENTER);
             } else {
                 drawCoin(canvas, cellRect.centerX() - dp(18), cellRect.centerY() + dp(14), dp(12));
-                text(canvas, Integer.toString(DAILY_REWARDS[i]), cellRect.centerX() + dp(6),
-                        cellRect.centerY() + dp(20), dp(18),
-                        current ? Palette.CARD_EDGE : Palette.TEXT, true, Paint.Align.CENTER);
+                text(canvas, Integer.toString(DAILY_REWARDS[i]), cellRect.centerX() + dp(6), cellRect.centerY() + dp(20),
+                        dp(18), current ? Palette.CARD_EDGE : Palette.TEXT, true, Paint.Align.CENTER);
             }
         }
 
@@ -858,9 +918,35 @@ public class GameView extends View implements Choreographer.FrameCallback {
         if (claimable) {
             drawButton(canvas, claim, "CLAIM", Palette.GREEN, Palette.GREEN_DK, dp(22));
         } else {
-            drawButton(canvas, claim, "COME BACK TOMORROW", Palette.STAR_OFF,
-                    Palette.scale(Palette.STAR_OFF, 0.8f), dp(15));
+            drawButton(canvas, claim, "COME BACK TOMORROW", Palette.STAR_OFF, Palette.scale(Palette.STAR_OFF, 0.8f), dp(15));
         }
+        RectF back = backBtn();
+        drawRoundIcon(canvas, back, Palette.CARD, Palette.CARD_EDGE);
+        drawBackArrow(canvas, back.centerX(), back.centerY(), dp(13));
+    }
+
+    // ---- STATS ---------------------------------------------------------
+
+    private void drawStats(Canvas canvas) {
+        drawTopCoins(canvas);
+        RectF card = new RectF(W * 0.1f, H * 0.2f, W * 0.9f, H * 0.8f);
+        drawPanel(canvas, card, dp(28));
+        text(canvas, "YOUR STATS", W / 2f, card.top + dp(54), dp(28), Palette.TEXT, true, Paint.Align.CENTER);
+
+        String[][] rows = {
+                {"Levels cleared", Integer.toString(store.levelsCleared())},
+                {"Total stars", Integer.toString(store.totalStars())},
+                {"Best score", comma(store.bestScore())},
+                {"Coins", comma(store.coins())},
+        };
+        float ry = card.top + dp(110);
+        for (String[] r : rows) {
+            text(canvas, r[0], card.left + dp(34), ry, dp(17), Palette.TEXT_DIM, false, Paint.Align.LEFT);
+            text(canvas, r[1], card.right - dp(34), ry, dp(20), Palette.TEXT, true, Paint.Align.RIGHT);
+            ry += dp(50);
+        }
+
+        drawButton(canvas, statsReset(), "RESET PROGRESS", Palette.RED, Palette.RED_DK, dp(16));
         RectF back = backBtn();
         drawRoundIcon(canvas, back, Palette.CARD, Palette.CARD_EDGE);
         drawBackArrow(canvas, back.centerX(), back.centerY(), dp(13));
@@ -873,8 +959,9 @@ public class GameView extends View implements Choreographer.FrameCallback {
     private void drawParticles(Canvas canvas) {
         p.setStyle(Paint.Style.FILL);
         for (Effects.Particle pt : particles) {
-            p.setColor(Palette.withAlpha(pt.color, (int) (pt.alpha() * 255)));
-            canvas.drawCircle(pt.x, pt.y, pt.radius, p);
+            float a = pt.alpha();
+            p.setColor(Palette.withAlpha(pt.color, (int) (a * 255)));
+            canvas.drawCircle(pt.x, pt.y, Math.max(0.5f, pt.radius * (0.35f + 0.65f * a)), p);
         }
     }
 
@@ -891,10 +978,11 @@ public class GameView extends View implements Choreographer.FrameCallback {
     }
 
     private void drawBoardBubble(Canvas canvas, float cx, float cy, int idx, float scale, int alpha) {
-        if (bubbleShader == null) {
-            drawBubble(canvas, cx, cy, BR, idx, alpha);
+        if (bubbleShader == null || BR <= 0) {
             return;
         }
+        idx = Math.max(0, Math.min(Palette.BUBBLE.length - 1, idx));
+        int base = Palette.BUBBLE[idx];
         canvas.save();
         canvas.translate(cx, cy);
         if (scale != 1f) {
@@ -905,24 +993,35 @@ public class GameView extends View implements Choreographer.FrameCallback {
         p.setAlpha(alpha);
         canvas.drawCircle(0, 0, BR, p);
         p.setShader(null);
-        p.setColor(Palette.withAlpha(0xFFFFFFFF, (int) (alpha * 0.55f)));
-        canvas.drawCircle(-BR * 0.3f, -BR * 0.34f, BR * 0.2f, p);
+        // darker rim for definition against neighbours
+        p.setStyle(Paint.Style.STROKE);
+        p.setStrokeWidth(BR * 0.09f);
+        p.setColor(Palette.withAlpha(Palette.scale(base, 0.72f), alpha));
+        canvas.drawCircle(0, 0, BR * 0.95f, p);
+        p.setStyle(Paint.Style.FILL);
+        // soft glossy sheen + specular dot
+        p.setColor(Palette.withAlpha(0xFFFFFFFF, (int) (alpha * 0.32f)));
+        canvas.drawCircle(-BR * 0.26f, -BR * 0.3f, BR * 0.34f, p);
+        p.setColor(Palette.withAlpha(0xFFFFFFFF, (int) (alpha * 0.85f)));
+        canvas.drawCircle(-BR * 0.32f, -BR * 0.35f, BR * 0.13f, p);
         p.setAlpha(255);
         canvas.restore();
     }
 
-    /** General bubble (creates its own gradient) for UI use. */
     private void drawBubble(Canvas canvas, float cx, float cy, float r, int idx, int alpha) {
+        if (r <= 0) {
+            return;
+        }
         idx = Math.max(0, Math.min(Palette.BUBBLE.length - 1, idx));
         int base = Palette.BUBBLE[idx];
         p.setStyle(Paint.Style.FILL);
         p.setShader(new RadialGradient(cx - r * 0.34f, cy - r * 0.36f, r * 1.35f,
-                new int[]{Palette.lighten(base, 0.65f), base, Palette.scale(base, 0.8f)},
+                new int[]{Palette.lighten(base, 0.7f), base, Palette.scale(base, 0.78f)},
                 new float[]{0f, 0.5f, 1f}, Shader.TileMode.CLAMP));
         p.setAlpha(alpha);
         canvas.drawCircle(cx, cy, r, p);
         p.setShader(null);
-        p.setColor(Palette.withAlpha(0xFFFFFFFF, (int) (alpha * 0.55f)));
+        p.setColor(Palette.withAlpha(0xFFFFFFFF, (int) (alpha * 0.6f)));
         canvas.drawCircle(cx - r * 0.3f, cy - r * 0.34f, r * 0.2f, p);
         p.setAlpha(255);
     }
@@ -930,8 +1029,7 @@ public class GameView extends View implements Choreographer.FrameCallback {
     private void drawPanel(Canvas canvas, RectF r, float radius) {
         p.setStyle(Paint.Style.FILL);
         p.setColor(0x55000000);
-        canvas.drawRoundRect(new RectF(r.left, r.top + dp(6), r.right, r.bottom + dp(8)),
-                radius, radius, p);
+        canvas.drawRoundRect(new RectF(r.left, r.top + dp(6), r.right, r.bottom + dp(8)), radius, radius, p);
         p.setColor(Palette.CARD);
         canvas.drawRoundRect(r, radius, radius, p);
         p.setStyle(Paint.Style.STROKE);
@@ -945,23 +1043,23 @@ public class GameView extends View implements Choreographer.FrameCallback {
         float radius = r.height() / 2.4f;
         p.setStyle(Paint.Style.FILL);
         p.setColor(edge);
-        canvas.drawRoundRect(new RectF(r.left, r.top + dp(5), r.right, r.bottom + dp(5)),
-                radius, radius, p);
-        p.setColor(fill);
+        canvas.drawRoundRect(new RectF(r.left, r.top + dp(5), r.right, r.bottom + dp(5)), radius, radius, p);
+        // glossy vertical face
+        p.setShader(new LinearGradient(0, r.top, 0, r.bottom,
+                Palette.lighten(fill, 0.22f), Palette.scale(fill, 0.92f), Shader.TileMode.CLAMP));
         canvas.drawRoundRect(r, radius, radius, p);
-        p.setColor(Palette.withAlpha(0xFFFFFFFF, 40));
-        canvas.drawRoundRect(new RectF(r.left + dp(6), r.top + dp(5), r.right - dp(6),
-                r.top + r.height() * 0.42f), radius * 0.6f, radius * 0.6f, p);
-        text(canvas, label, r.centerX(), r.centerY() + textSize * 0.36f, textSize, Palette.TEXT,
-                true, Paint.Align.CENTER);
+        p.setShader(null);
+        p.setColor(Palette.withAlpha(0xFFFFFFFF, 55));
+        canvas.drawRoundRect(new RectF(r.left + dp(6), r.top + dp(5), r.right - dp(6), r.top + r.height() * 0.44f),
+                radius * 0.6f, radius * 0.6f, p);
+        text(canvas, label, r.centerX(), r.centerY() + textSize * 0.36f, textSize, Palette.TEXT, true, Paint.Align.CENTER);
     }
 
     private void drawRoundIcon(Canvas canvas, RectF r, int fill, int edge) {
         float radius = r.height() / 2.6f;
         p.setStyle(Paint.Style.FILL);
         p.setColor(edge);
-        canvas.drawRoundRect(new RectF(r.left, r.top + dp(4), r.right, r.bottom + dp(4)),
-                radius, radius, p);
+        canvas.drawRoundRect(new RectF(r.left, r.top + dp(4), r.right, r.bottom + dp(4)), radius, radius, p);
         p.setColor(fill);
         canvas.drawRoundRect(r, radius, radius, p);
     }
@@ -971,29 +1069,25 @@ public class GameView extends View implements Choreographer.FrameCallback {
         p.setStyle(Paint.Style.FILL);
         if (armedNow) {
             p.setColor(Palette.COMBO);
-            canvas.drawRoundRect(new RectF(r.left - dp(3), r.top - dp(3), r.right + dp(3),
-                    r.bottom + dp(3)), radius + dp(3), radius + dp(3), p);
+            canvas.drawRoundRect(new RectF(r.left - dp(3), r.top - dp(3), r.right + dp(3), r.bottom + dp(3)),
+                    radius + dp(3), radius + dp(3), p);
         }
         p.setColor(0x55000000);
-        canvas.drawRoundRect(new RectF(r.left, r.top + dp(4), r.right, r.bottom + dp(4)),
-                radius, radius, p);
+        canvas.drawRoundRect(new RectF(r.left, r.top + dp(4), r.right, r.bottom + dp(4)), radius, radius, p);
         p.setColor(count > 0 ? Palette.CARD : Palette.scale(Palette.CARD, 0.7f));
         canvas.drawRoundRect(r, radius, radius, p);
 
-        float cx = r.centerX(), cy = r.centerY();
-        float s = r.height() * 0.3f;
+        float cx = r.centerX(), cy = r.centerY(), s = r.height() * 0.3f;
         switch (id) {
             case B_BOMB: drawBombIcon(canvas, cx, cy, s); break;
             case B_RAINBOW: drawRainbowIcon(canvas, cx, cy, s); break;
             case B_HAMMER: drawHammerIcon(canvas, cx, cy, s); break;
             default: drawPlusMovesIcon(canvas, cx, cy, s); break;
         }
-        // Count badge.
         float bx = r.right - dp(4), by = r.top + dp(4);
         p.setColor(count > 0 ? Palette.RED : Palette.STAR_OFF);
         canvas.drawCircle(bx, by, dp(11), p);
-        text(canvas, Integer.toString(count), bx, by + dp(5), dp(13), Palette.TEXT, true,
-                Paint.Align.CENTER);
+        text(canvas, Integer.toString(count), bx, by + dp(5), dp(13), Palette.TEXT, true, Paint.Align.CENTER);
     }
 
     private void drawCoin(Canvas canvas, float cx, float cy, float r) {
@@ -1008,6 +1102,9 @@ public class GameView extends View implements Choreographer.FrameCallback {
     }
 
     private void drawStar(Canvas canvas, float cx, float cy, float r, int color) {
+        if (r <= 0) {
+            return;
+        }
         Path path = new Path();
         float inner = r * 0.45f;
         for (int i = 0; i < 10; i++) {
@@ -1043,8 +1140,7 @@ public class GameView extends View implements Choreographer.FrameCallback {
         p.setColor(0x44000000);
         canvas.drawRoundRect(pill, dp(18), dp(18), p);
         drawCoin(canvas, pill.left + dp(18), cy, dp(13));
-        text(canvas, coins, pill.right - dp(12), cy + dp(6), dp(18), Palette.TEXT, true,
-                Paint.Align.RIGHT);
+        text(canvas, coins, pill.right - dp(12), cy + dp(6), dp(18), Palette.TEXT, true, Paint.Align.RIGHT);
     }
 
     private void dimScreen(Canvas canvas) {
@@ -1056,6 +1152,7 @@ public class GameView extends View implements Choreographer.FrameCallback {
     // ---- tiny vector icons --------------------------------------------
 
     private void drawBombIcon(Canvas canvas, float cx, float cy, float s) {
+        p.setStyle(Paint.Style.FILL);
         p.setColor(0xFF2A2A3A);
         canvas.drawCircle(cx, cy + s * 0.2f, s, p);
         p.setStyle(Paint.Style.STROKE);
@@ -1074,8 +1171,7 @@ public class GameView extends View implements Choreographer.FrameCallback {
         for (int i = 0; i < cols.length; i++) {
             p.setColor(cols[i]);
             float rr = s * (1.25f - i * 0.32f);
-            canvas.drawArc(new RectF(cx - rr, cy - rr + s * 0.4f, cx + rr, cy + rr + s * 0.4f),
-                    180, 180, false, p);
+            canvas.drawArc(new RectF(cx - rr, cy - rr + s * 0.4f, cx + rr, cy + rr + s * 0.4f), 180, 180, false, p);
         }
         p.setStyle(Paint.Style.FILL);
     }
@@ -1084,11 +1180,9 @@ public class GameView extends View implements Choreographer.FrameCallback {
         canvas.save();
         canvas.rotate(-35, cx, cy);
         p.setColor(0xFFB97A3A);
-        canvas.drawRoundRect(new RectF(cx - s * 0.18f, cy - s * 0.1f, cx + s * 0.18f, cy + s * 1.3f),
-                dp(2), dp(2), p);
+        canvas.drawRoundRect(new RectF(cx - s * 0.18f, cy - s * 0.1f, cx + s * 0.18f, cy + s * 1.3f), dp(2), dp(2), p);
         p.setColor(0xFFB0B6C2);
-        canvas.drawRoundRect(new RectF(cx - s * 1.1f, cy - s * 1.1f, cx + s * 1.1f, cy - s * 0.1f),
-                dp(3), dp(3), p);
+        canvas.drawRoundRect(new RectF(cx - s * 1.1f, cy - s * 1.1f, cx + s * 1.1f, cy - s * 0.1f), dp(3), dp(3), p);
         canvas.restore();
     }
 
@@ -1106,10 +1200,19 @@ public class GameView extends View implements Choreographer.FrameCallback {
         canvas.drawRect(cx - s * 0.16f, cy - s * 0.6f, cx + s * 0.16f, cy + s, p);
     }
 
+    private void drawChest(Canvas canvas, float cx, float cy, float s) {
+        p.setColor(0xFF8A5A2B);
+        canvas.drawRoundRect(new RectF(cx - s, cy - s * 0.2f, cx + s, cy + s), dp(3), dp(3), p);
+        p.setColor(0xFFB97A3A);
+        canvas.drawRoundRect(new RectF(cx - s, cy - s * 0.7f, cx + s, cy - s * 0.1f), dp(4), dp(4), p);
+        p.setColor(Palette.GOLD);
+        canvas.drawRect(cx - s * 0.16f, cy - s * 0.7f, cx + s * 0.16f, cy + s, p);
+        canvas.drawCircle(cx, cy - s * 0.15f, s * 0.18f, p);
+    }
+
     private void drawTrophyIcon(Canvas canvas, float cx, float cy, float s) {
         p.setColor(Palette.TEXT);
-        canvas.drawRoundRect(new RectF(cx - s * 0.7f, cy - s, cx + s * 0.7f, cy + s * 0.2f),
-                dp(3), dp(3), p);
+        canvas.drawRoundRect(new RectF(cx - s * 0.7f, cy - s, cx + s * 0.7f, cy + s * 0.2f), dp(3), dp(3), p);
         canvas.drawRect(cx - s * 0.2f, cy + s * 0.2f, cx + s * 0.2f, cy + s * 0.7f, p);
         canvas.drawRect(cx - s * 0.6f, cy + s * 0.7f, cx + s * 0.6f, cy + s, p);
     }
@@ -1128,8 +1231,7 @@ public class GameView extends View implements Choreographer.FrameCallback {
         p.setStyle(Paint.Style.STROKE);
         p.setStrokeWidth(dp(2));
         if (on) {
-            canvas.drawArc(new RectF(cx, cy - s * 0.7f, cx + s * 1.3f, cy + s * 0.7f), -50, 100,
-                    false, p);
+            canvas.drawArc(new RectF(cx, cy - s * 0.7f, cx + s * 1.3f, cy + s * 0.7f), -50, 100, false, p);
         } else {
             canvas.drawLine(cx + s * 0.6f, cy - s * 0.5f, cx + s * 1.3f, cy + s * 0.5f, p);
             canvas.drawLine(cx + s * 1.3f, cy - s * 0.5f, cx + s * 0.6f, cy + s * 0.5f, p);
@@ -1139,12 +1241,10 @@ public class GameView extends View implements Choreographer.FrameCallback {
 
     private void drawLockIcon(Canvas canvas, float cx, float cy, float s) {
         p.setColor(0xFFCBC4E8);
-        canvas.drawRoundRect(new RectF(cx - s * 0.7f, cy - s * 0.1f, cx + s * 0.7f, cy + s * 0.8f),
-                dp(3), dp(3), p);
+        canvas.drawRoundRect(new RectF(cx - s * 0.7f, cy - s * 0.1f, cx + s * 0.7f, cy + s * 0.8f), dp(3), dp(3), p);
         p.setStyle(Paint.Style.STROKE);
         p.setStrokeWidth(dp(3));
-        canvas.drawArc(new RectF(cx - s * 0.45f, cy - s * 0.7f, cx + s * 0.45f, cy + s * 0.2f),
-                180, 180, false, p);
+        canvas.drawArc(new RectF(cx - s * 0.45f, cy - s * 0.7f, cx + s * 0.45f, cy + s * 0.2f), 180, 180, false, p);
         p.setStyle(Paint.Style.FILL);
     }
 
@@ -1180,21 +1280,21 @@ public class GameView extends View implements Choreographer.FrameCallback {
 
     private RectF menuPlay() {
         float w = W * 0.62f;
-        return new RectF((W - w) / 2f, H * 0.58f, (W + w) / 2f, H * 0.58f + dp(66));
+        return new RectF((W - w) / 2f, H * 0.56f, (W + w) / 2f, H * 0.56f + dp(66));
     }
 
     private RectF menuDaily() {
-        float y = H * 0.74f, r = dp(34);
+        float y = H * 0.73f, r = dp(32);
         return new RectF(W * 0.5f - dp(110) - r, y - r, W * 0.5f - dp(110) + r, y + r);
     }
 
-    private RectF menuMap() {
-        float y = H * 0.74f, r = dp(34);
+    private RectF menuStats() {
+        float y = H * 0.73f, r = dp(32);
         return new RectF(W * 0.5f - r, y - r, W * 0.5f + r, y + r);
     }
 
     private RectF menuSound() {
-        float y = H * 0.74f, r = dp(34);
+        float y = H * 0.73f, r = dp(32);
         return new RectF(W * 0.5f + dp(110) - r, y - r, W * 0.5f + dp(110) + r, y + r);
     }
 
@@ -1204,14 +1304,14 @@ public class GameView extends View implements Choreographer.FrameCallback {
 
     private RectF pregamePlay() {
         float w = W * 0.5f;
-        return new RectF((W - w) / 2f, H * 0.82f - dp(78), (W + w) / 2f, H * 0.82f - dp(78) + dp(60));
+        return new RectF((W - w) / 2f, H * 0.84f - dp(76), (W + w) / 2f, H * 0.84f - dp(76) + dp(58));
     }
 
     private RectF[] boosterBar() {
         RectF[] out = new RectF[4];
         float size = dp(54);
         float gap = (W - dp(40) - size * 4) / 3f;
-        float y = H - dp(78);
+        float y = H - dp(86);
         for (int i = 0; i < 4; i++) {
             float x = dp(20) + i * (size + gap);
             out[i] = new RectF(x, y, x + size, y + size);
@@ -1229,19 +1329,29 @@ public class GameView extends View implements Choreographer.FrameCallback {
         return new RectF((W - w) / 2f, H * 0.8f - dp(8), (W + w) / 2f, H * 0.8f - dp(8) + dp(44));
     }
 
+    private RectF failedContinue() {
+        float w = W * 0.6f;
+        return new RectF((W - w) / 2f, H * 0.78f - dp(140), (W + w) / 2f, H * 0.78f - dp(140) + dp(52));
+    }
+
     private RectF failedRetry() {
         float w = W * 0.5f;
-        return new RectF((W - w) / 2f, H * 0.76f - dp(72), (W + w) / 2f, H * 0.76f - dp(72) + dp(58));
+        return new RectF((W - w) / 2f, H * 0.78f - dp(74), (W + w) / 2f, H * 0.78f - dp(74) + dp(56));
     }
 
     private RectF failedHome() {
         float w = W * 0.34f;
-        return new RectF((W - w) / 2f, H * 0.76f - dp(8), (W + w) / 2f, H * 0.76f - dp(8) + dp(44));
+        return new RectF((W - w) / 2f, H * 0.78f - dp(10), (W + w) / 2f, H * 0.78f - dp(10) + dp(42));
     }
 
     private RectF dailyClaim() {
         float w = W * 0.6f;
         return new RectF((W - w) / 2f, H * 0.84f - dp(70), (W + w) / 2f, H * 0.84f - dp(70) + dp(56));
+    }
+
+    private RectF statsReset() {
+        float w = W * 0.5f;
+        return new RectF((W - w) / 2f, H * 0.8f - dp(70), (W + w) / 2f, H * 0.8f - dp(70) + dp(52));
     }
 
     // ===================================================================
@@ -1250,30 +1360,34 @@ public class GameView extends View implements Choreographer.FrameCallback {
 
     @Override
     public boolean onTouchEvent(MotionEvent e) {
-        switch (e.getActionMasked()) {
-            case MotionEvent.ACTION_DOWN:
-                downX = e.getX();
-                downY = e.getY();
-                lastY = downY;
-                movedWhileDown = false;
-                return true;
-            case MotionEvent.ACTION_MOVE:
-                if (state == State.MAP) {
-                    float dy = e.getY() - lastY;
-                    mapScroll = clamp(mapScroll - dy, 0, mapScrollMax);
-                    lastY = e.getY();
-                }
-                if (Math.abs(e.getX() - downX) > dp(10) || Math.abs(e.getY() - downY) > dp(10)) {
-                    movedWhileDown = true;
-                }
-                return true;
-            case MotionEvent.ACTION_UP:
-                if (!movedWhileDown) {
-                    handleTap(e.getX(), e.getY());
-                }
-                return true;
-            default:
-                return true;
+        try {
+            switch (e.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                    downX = e.getX();
+                    downY = e.getY();
+                    lastY = downY;
+                    movedWhileDown = false;
+                    return true;
+                case MotionEvent.ACTION_MOVE:
+                    if (state == State.MAP) {
+                        mapScroll = clamp(mapScroll - (e.getY() - lastY), 0, mapScrollMax);
+                        lastY = e.getY();
+                    }
+                    if (Math.abs(e.getX() - downX) > dp(10) || Math.abs(e.getY() - downY) > dp(10)) {
+                        movedWhileDown = true;
+                    }
+                    return true;
+                case MotionEvent.ACTION_UP:
+                    if (!movedWhileDown) {
+                        handleTap(e.getX(), e.getY());
+                    }
+                    return true;
+                default:
+                    return true;
+            }
+        } catch (Throwable t) {
+            safeRecover();
+            return true;
         }
     }
 
@@ -1283,26 +1397,26 @@ public class GameView extends View implements Choreographer.FrameCallback {
             case MAP: tapMap(x, y); break;
             case PREGAME: tapPregame(x, y); break;
             case PLAYING: tapGame(x, y); break;
+            case ANIM: bufferTap(x, y); break;
             case COMPLETE: tapComplete(x, y); break;
             case FAILED: tapFailed(x, y); break;
             case DAILY: tapDaily(x, y); break;
+            case STATS: tapStats(x, y); break;
             default: break;
         }
     }
 
     private void tapMenu(float x, float y) {
         if (menuPlay().contains(x, y)) {
-            state = State.MAP;
-            mapScroll = mapScrollMax;
-            transFade = 0f;
-            sound.playClick();
+            gotoMap();
         } else if (menuDaily().contains(x, y)) {
+            clearFx();
             state = State.DAILY;
             transFade = 0f;
             sound.playClick();
-        } else if (menuMap().contains(x, y)) {
-            state = State.MAP;
-            mapScroll = mapScrollMax;
+        } else if (menuStats().contains(x, y)) {
+            clearFx();
+            state = State.STATS;
             transFade = 0f;
             sound.playClick();
         } else if (menuSound().contains(x, y)) {
@@ -1313,8 +1427,17 @@ public class GameView extends View implements Choreographer.FrameCallback {
         }
     }
 
+    private void gotoMap() {
+        clearFx();
+        state = State.MAP;
+        mapScroll = mapScrollMax;
+        transFade = 0f;
+        sound.playClick();
+    }
+
     private void tapMap(float x, float y) {
         if (backBtn().contains(x, y)) {
+            clearFx();
             state = State.MENU;
             transFade = 0f;
             sound.playClick();
@@ -1325,9 +1448,8 @@ public class GameView extends View implements Choreographer.FrameCallback {
         for (int i = 0; i < count; i++) {
             float nx = nodeX(i), ny = nodeY(i);
             if ((x - nx) * (x - nx) + (y - ny) * (y - ny) <= dp(34) * dp(34)) {
-                int lvl = i + 1;
-                if (lvl <= unlocked) {
-                    startPregame(lvl);
+                if (i + 1 <= unlocked) {
+                    startPregame(i + 1);
                 }
                 return;
             }
@@ -1337,19 +1459,31 @@ public class GameView extends View implements Choreographer.FrameCallback {
     private void tapPregame(float x, float y) {
         if (pregamePlay().contains(x, y)) {
             startGame();
-        } else if (backBtn().contains(x, y)) {
-            state = State.MAP;
-            transFade = 0f;
-            sound.playClick();
+            return;
+        }
+        if (backBtn().contains(x, y)) {
+            gotoMap();
+            return;
+        }
+        RectF[] slots = pregameBoosterSlots();
+        for (int i = 0; i < 4; i++) {
+            if (slots[i].contains(x, y)) {
+                if (store.spendCoins(B_PRICE[i])) {
+                    store.addBooster(i, 1);
+                    floatText("+1 " + B_NAMES[i], slots[i].centerX(), slots[i].top, dp(15), Palette.GREEN, true);
+                    sound.playCoin();
+                } else {
+                    floatText("Need more coins", W / 2f, slots[i].top - dp(10), dp(15), Palette.RED, true);
+                    sound.playClick();
+                }
+                return;
+            }
         }
     }
 
     private void tapGame(float x, float y) {
         if (backBtn().contains(x, y)) {
-            state = State.MAP;
-            mapScroll = mapScrollMax;
-            transFade = 0f;
-            sound.playClick();
+            gotoMap();
             return;
         }
         RectF[] slots = boosterBar();
@@ -1359,22 +1493,35 @@ public class GameView extends View implements Choreographer.FrameCallback {
                 return;
             }
         }
-        // Board tap.
-        if (board != null && x >= boardX && x < boardX + boardW && y >= boardY && y < boardY + boardH) {
-            int c = (int) ((x - boardX) / cell);
-            int r = (int) ((y - boardY) / cell);
-            if (r < 0 || c < 0 || r >= board.rows || c >= board.cols) {
-                return;
-            }
-            if (board.colorAt(r, c) == Board.EMPTY) {
-                return;
-            }
+        int[] cell = boardCell(x, y);
+        if (cell != null) {
             if (armed != B_NONE) {
-                applyBooster(r, c);
+                applyBooster(cell[0], cell[1]);
             } else {
-                tryPop(r, c);
+                tryPop(cell[0], cell[1]);
             }
         }
+    }
+
+    /** Buffer a board tap made during the pop/fall animation so combos keep flowing. */
+    private void bufferTap(float x, float y) {
+        int[] cell = boardCell(x, y);
+        if (cell != null && armed == B_NONE) {
+            bufR = cell[0];
+            bufC = cell[1];
+        }
+    }
+
+    private int[] boardCell(float x, float y) {
+        if (board == null || x < boardX || x >= boardX + boardW || y < boardY || y >= boardY + boardH) {
+            return null;
+        }
+        int c = (int) ((x - boardX) / cell);
+        int r = (int) ((y - boardY) / cell);
+        if (r < 0 || c < 0 || r >= board.rows || c >= board.cols || board.colorAt(r, c) == Board.EMPTY) {
+            return null;
+        }
+        return new int[]{r, c};
     }
 
     private void tapBooster(int id) {
@@ -1382,10 +1529,10 @@ public class GameView extends View implements Choreographer.FrameCallback {
             if (store.booster(B_MOVES) > 0) {
                 store.addBooster(B_MOVES, -1);
                 movesLeft += 5;
-                floats.add(new Effects.FloatingText("+5 MOVES", W * 0.16f, H * 0.085f + dp(60),
-                        dp(18), Palette.GREEN, 1.0f, true));
+                floatText("+5 MOVES", W * 0.22f, H * 0.115f + dp(50), dp(18), Palette.GREEN, true);
                 sound.playCoin();
             } else {
+                floatText("Out of +5", W * 0.22f, H * 0.115f + dp(50), dp(14), Palette.RED, true);
                 sound.playClick();
             }
             return;
@@ -1394,6 +1541,7 @@ public class GameView extends View implements Choreographer.FrameCallback {
             armed = (armed == id) ? B_NONE : id;
             sound.playClick();
         } else {
+            floatText("Out of " + B_NAMES[id], W / 2f, boardY + boardH + dp(6), dp(14), Palette.RED, true);
             sound.playClick();
         }
     }
@@ -1402,21 +1550,27 @@ public class GameView extends View implements Choreographer.FrameCallback {
         if (completeNext().contains(x, y)) {
             startPregame(selectedLevel + 1);
         } else if (completeHome().contains(x, y)) {
-            state = State.MAP;
-            mapScroll = mapScrollMax;
-            transFade = 0f;
-            sound.playClick();
+            gotoMap();
         }
     }
 
     private void tapFailed(float x, float y) {
-        if (failedRetry().contains(x, y)) {
+        boolean canRescue = store.booster(B_MOVES) > 0 || store.coins() >= B_PRICE[B_MOVES];
+        if (canRescue && failedContinue().contains(x, y)) {
+            if (store.booster(B_MOVES) > 0) {
+                store.addBooster(B_MOVES, -1);
+            } else {
+                store.spendCoins(B_PRICE[B_MOVES]);
+            }
+            movesLeft += 5;
+            state = State.PLAYING; // resume the SAME board
+            transFade = 0f;
+            floatText("+5 MOVES", W / 2f, H * 0.4f, dp(22), Palette.GREEN, true);
+            sound.playCoin();
+        } else if (failedRetry().contains(x, y)) {
             startGame();
         } else if (failedHome().contains(x, y)) {
-            state = State.MAP;
-            mapScroll = mapScrollMax;
-            transFade = 0f;
-            sound.playClick();
+            gotoMap();
         }
     }
 
@@ -1428,13 +1582,27 @@ public class GameView extends View implements Choreographer.FrameCallback {
             long t = today();
             int newStreak = (t == store.lastClaimDay() + 1) ? store.dailyStreak() + 1 : 1;
             store.setDaily(t, newStreak);
-            floats.add(new Effects.FloatingText("+" + reward, W / 2f, H * 0.5f, dp(28),
-                    Palette.GOLD, 1.2f, true));
+            floatText("+" + reward, W / 2f, H * 0.5f, dp(28), Palette.GOLD, true);
             if (idx == 6) {
                 store.addBooster(rng.nextInt(4), 2);
             }
             sound.playCoin();
         } else if (backBtn().contains(x, y)) {
+            clearFx();
+            state = State.MENU;
+            transFade = 0f;
+            sound.playClick();
+        }
+    }
+
+    private void tapStats(float x, float y) {
+        if (statsReset().contains(x, y)) {
+            store.resetAll();
+            selectedLevel = 1;
+            floatText("Progress reset", W / 2f, H * 0.5f, dp(20), Palette.RED, true);
+            sound.playClick();
+        } else if (backBtn().contains(x, y)) {
+            clearFx();
             state = State.MENU;
             transFade = 0f;
             sound.playClick();
@@ -1451,11 +1619,13 @@ public class GameView extends View implements Choreographer.FrameCallback {
             case PREGAME:
             case COMPLETE:
             case FAILED:
+                clearFx();
                 state = State.MAP;
                 mapScroll = mapScrollMax;
                 transFade = 0f;
                 return true;
             default:
+                clearFx();
                 state = State.MENU;
                 transFade = 0f;
                 return true;
@@ -1466,13 +1636,21 @@ public class GameView extends View implements Choreographer.FrameCallback {
     //  Small helpers
     // ===================================================================
 
-    private void text(Canvas canvas, String s, float x, float y, float size, int color,
-                      boolean bold, Paint.Align align) {
+    private void text(Canvas canvas, String s, float x, float y, float size, int color, boolean bold, Paint.Align align) {
         tp.setTextSize(size);
         tp.setColor(color);
         tp.setFakeBoldText(bold);
         tp.setTextAlign(align);
         canvas.drawText(s, x, y, tp);
+    }
+
+    /** Right-aligned text that auto-shrinks to fit maxW (keeps large scores on screen). */
+    private void textRight(Canvas canvas, String s, float xRight, float y, float maxSize, float maxW, int color) {
+        tp.setFakeBoldText(true);
+        tp.setTextSize(maxSize);
+        float w = tp.measureText(s);
+        float size = (w > maxW && w > 0) ? maxSize * maxW / w : maxSize;
+        text(canvas, s, xRight, y, size, color, true, Paint.Align.RIGHT);
     }
 
     private static String comma(int v) {

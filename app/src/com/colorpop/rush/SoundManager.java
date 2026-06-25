@@ -6,6 +6,8 @@ import android.media.AudioTrack;
 import android.os.Handler;
 import android.os.HandlerThread;
 
+import java.util.concurrent.atomic.AtomicInteger;
+
 /**
  * Procedurally synthesised sound effects. All PCM is generated at runtime so
  * the APK ships no audio assets. Everything is wrapped defensively: if audio
@@ -15,10 +17,13 @@ public class SoundManager {
 
     private static final int RATE = 22050;
 
+    private static final int MAX_VOICES = 6;
+
     private HandlerThread thread;
     private Handler handler;
     private boolean enabled = true;
     private volatile boolean released = false;
+    private final AtomicInteger active = new AtomicInteger(0);
 
     // Pre-rendered clips.
     private short[] click;
@@ -89,41 +94,49 @@ public class SoundManager {
     // --- Playback ---------------------------------------------------------
 
     private void play(final short[] data) {
-        if (!enabled || released || handler == null || data == null) {
+        if (!enabled || released || handler == null || data == null || data.length == 0) {
+            return;
+        }
+        // Cap simultaneous voices so rapid combos can't exhaust native AudioTrack
+        // resources (the original per-sound allocation could leak/exhaust on some OEMs).
+        if (active.get() >= MAX_VOICES) {
             return;
         }
         try {
             handler.post(new Runnable() {
                 @Override
                 public void run() {
-                    AudioTrack track = null;
+                    final AudioTrack track;
                     try {
                         int bytes = data.length * 2;
                         track = new AudioTrack(AudioManager.STREAM_MUSIC, RATE,
                                 AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT,
                                 bytes, AudioTrack.MODE_STATIC);
+                    } catch (Throwable t) {
+                        return;
+                    }
+                    try {
                         if (track.getState() != AudioTrack.STATE_INITIALIZED) {
                             track.release();
                             return;
                         }
+                        active.incrementAndGet();
                         track.write(data, 0, data.length);
-                        final AudioTrack t = track;
-                        track.setNotificationMarkerPosition(data.length);
-                        track.setPlaybackPositionUpdateListener(
-                                new AudioTrack.OnPlaybackPositionUpdateListener() {
-                                    @Override
-                                    public void onMarkerReached(AudioTrack at) {
-                                        try { at.stop(); } catch (Throwable ignored) {}
-                                        try { at.release(); } catch (Throwable ignored) {}
-                                    }
-                                    @Override
-                                    public void onPeriodicNotification(AudioTrack at) {}
-                                }, handler);
                         track.play();
+                        // Guaranteed teardown: never rely on the marker callback (it may
+                        // never fire on some devices, leaking the native track).
+                        long ms = (long) (data.length * 1000L / RATE) + 90L;
+                        handler.postDelayed(new Runnable() {
+                            @Override
+                            public void run() {
+                                try { track.stop(); } catch (Throwable ignored) {}
+                                try { track.release(); } catch (Throwable ignored) {}
+                                active.decrementAndGet();
+                            }
+                        }, ms);
                     } catch (Throwable t) {
-                        if (track != null) {
-                            try { track.release(); } catch (Throwable ignored) {}
-                        }
+                        try { track.release(); } catch (Throwable ignored) {}
+                        active.decrementAndGet();
                     }
                 }
             });

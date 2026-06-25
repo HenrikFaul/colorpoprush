@@ -83,6 +83,27 @@ public class Storage {
         prefs.edit().putInt("booster_" + id, Math.max(0, booster(id) + delta)).apply();
     }
 
+    // --- Stats ------------------------------------------------------------
+
+    public int bestScore() {
+        return prefs.getInt("best", 0);
+    }
+
+    public void submitScore(int score) {
+        if (score > bestScore()) {
+            prefs.edit().putInt("best", score).apply();
+        }
+    }
+
+    public int levelsCleared() {
+        return Math.max(0, unlockedLevel() - 1);
+    }
+
+    /** Wipes all progress (used by the stats screen reset button). */
+    public void resetAll() {
+        prefs.edit().clear().apply();
+    }
+
     // --- Settings ---------------------------------------------------------
 
     public boolean soundOn() {

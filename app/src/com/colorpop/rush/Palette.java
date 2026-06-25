@@ -17,10 +17,10 @@ public final class Palette {
             0xFF9B5DE5, // 5 purple
     };
 
-    // Backgrounds
-    public static final int BG_TOP = 0xFF241A4E;
-    public static final int BG_BOTTOM = 0xFF3E2A86;
-    public static final int BOARD_BG = 0x33120B33;
+    // Backgrounds — vibrant candy purple-blue (matches the icon), dark enough for white text
+    public static final int BG_TOP = 0xFF3D2C9A;
+    public static final int BG_BOTTOM = 0xFF6248D8;
+    public static final int BOARD_BG = 0x26FFFFFF;
 
     // Panels / cards
     public static final int CARD = 0xFF2E2160;

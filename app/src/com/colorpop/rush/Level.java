@@ -1,10 +1,14 @@
 package com.colorpop.rush;
 
 /**
- * Procedurally describes a single level. The formulas give a smooth difficulty
- * ramp over an effectively unbounded number of levels ("thousands of levels"),
- * tuned so the values roughly match the design sheet (e.g. level 48 ~ 25 moves,
- * target ~40). Pure Java: no Android dependencies.
+ * Procedurally describes a single level. Difficulty ramps smoothly over an
+ * effectively unbounded number of levels ("thousands of levels"). Pure Java.
+ *
+ * Winnability guarantee: the goal is to clear {@link #target} bubbles (any
+ * colour counts). Every pop clears at least 2 bubbles, so the most a player can
+ * clear is {@code 2 * moves}. We keep {@code target < 2 * moves} for every
+ * level, so every level is always beatable — fixing the original design where a
+ * single-colour target became impossible at higher levels.
  */
 public class Level {
 
@@ -13,8 +17,8 @@ public class Level {
     public final int rows;
     public final int numColors;
     public final int moves;      // taps that result in a pop
-    public final int target;     // bubbles of targetColor to collect
-    public final int targetColor;
+    public final int target;     // bubbles to clear
+    public final int accentColor; // decorative colour used for the goal icon
 
     public Level(int number) {
         this.number = Math.max(1, number);
@@ -27,15 +31,16 @@ public class Level {
         int colors = 4 + (n - 1) / 14;
         this.numColors = Math.min(6, Math.max(4, colors));
 
-        // Fewer moves as levels progress, floored so it stays beatable.
-        int mv = 30 - n / 8;
-        this.moves = clamp(mv, 16, 30);
+        // Moves decrease as levels progress, floored so it stays generous.
+        this.moves = clamp(30 - n / 12, 20, 30);
 
-        // Collection target grows steadily (~42 around level 48).
-        this.target = 18 + (int) Math.round(n * 0.5);
+        // Target ramps from ~1.0x to 1.9x of the move budget (always < 2x => winnable).
+        // Tuned so e.g. level 48 lands near 40 (matching the design sheet).
+        double ramp = clampD(1.0 + n * 0.011, 1.0, 1.9);
+        this.target = (int) Math.round(this.moves * ramp);
 
-        // Rotate the collectable colour so it varies level to level.
-        this.targetColor = n % this.numColors;
+        // Rotate the accent colour so the goal icon varies level to level.
+        this.accentColor = n % this.numColors;
     }
 
     /** Points awarded for popping a group of {@code n} bubbles (before combo). */
@@ -54,7 +59,7 @@ public class Level {
 
     /**
      * Stars earned: one for completing, plus efficiency bonuses for finishing
-     * with moves to spare.
+     * with moves to spare (rewards big groups and combos, which clear faster).
      */
     public int starsFor(int movesLeft) {
         int stars = 1;
@@ -68,6 +73,10 @@ public class Level {
     }
 
     private static int clamp(int v, int lo, int hi) {
+        return v < lo ? lo : (v > hi ? hi : v);
+    }
+
+    private static double clampD(double v, double lo, double hi) {
         return v < lo ? lo : (v > hi ? hi : v);
     }
 }

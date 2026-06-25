@@ -14,8 +14,9 @@ when you get stuck, and clear the level goal before you run out of moves.
 
 - **One-tap gameplay** — tap connected same-colour bubbles to pop them.
 - **Combos & chains** — keep popping to build a combo multiplier (up to ×10).
-- **Boosters** — 💣 Bomb (3×3 blast), 🌈 Rainbow (clear a whole colour),
-  🔨 Hammer (pop any bubble) and ➕ +5 Moves.
+- **Boosters** — 💣 Bomb (5×5 blast), 🌈 Rainbow (clear a whole colour),
+  🔨 Hammer (pop any bubble) and ➕ +5 Moves. Buy more with coins before a level,
+  or use **+5 Moves to continue** when you run out.
 - **Endless procedural levels** — difficulty (moves, target, colours) scales
   smoothly across thousands of levels.
 - **Level map** with per-level star ratings (1–3 stars based on efficiency).
@@ -75,6 +76,7 @@ sources"). Runs on Android 5.0 (API 21) and newer.
 
 1. Tap any cluster of **2 or more** touching bubbles of the same colour to pop them.
 2. Bigger clusters score far more; keep popping quickly to grow your **combo**.
-3. Collect the required number of the **target colour** (shown up top) before
-   your **moves** run out.
+3. **Clear the required number of bubbles** (the goal shown up top) before your
+   **moves** run out. Every pop counts toward the goal, so each level is always
+   beatable — bigger groups and combos just finish it faster (and earn more stars).
 4. Stuck? Tap a **booster** in the bottom bar, then tap the board to use it.
