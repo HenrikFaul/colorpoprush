@@ -62,10 +62,12 @@ public final class Effects {
             return age < maxAge;
         }
 
-        /** Eased-in scale that overshoots slightly then settles. */
+        /** Eased-in scale that overshoots slightly then settles (back-ease pop). */
         public float scale() {
             float t = Math.min(1f, age / (maxAge * 0.35f));
-            return 0.4f + 0.7f * (1f - (1f - t) * (1f - t));
+            float u = t - 1f;
+            float back = 1f + 2.70158f * u * u * u + 1.70158f * u * u; // easeOutBack
+            return 0.4f + 0.7f * back;
         }
 
         public float alpha() {
