@@ -14,16 +14,24 @@ when you get stuck, and clear the level goal before you run out of moves.
 
 - **One-tap gameplay** — tap connected same-colour bubbles to pop them.
 - **Combos & chains** — keep popping to build a combo multiplier (up to ×10).
-- **Power bubbles** — big matches forge specials that chain into cascades:
-  5+ → 🚀 Rocket (clears a row/column), 7+ → 💣 Bomb (5×5), 9+ → 🌈 Rainbow
-  (clears a colour). Tap to detonate; power tiles trigger each other.
-- **Varied objectives** — clear N bubbles, collect N of a colour, or reach a score.
-- **Boosters** — 💣 Bomb, 🌈 Rainbow, 🔨 Hammer, ➕ +5 Moves and 🔀 Shuffle.
-  Buy more with coins before a level, or **continue with +5 Moves** when you run out.
-- **Smarter play** — touch-and-hold previews the group (and the power it would
-  forge); an idle **hint** pulses a good move; stars are earned by **score**.
-- **Pause menu & Settings** — sound, haptics and a **colourblind symbol** mode;
-  plus a first-level coach.
+- **Power bubbles & fusion** — big matches forge specials: 5+ → 🚀 Rocket
+  (row/column), 7+ → 💣 Bomb (5×5), 9+ → 🌈 Rainbow (a colour). Tap to detonate;
+  power tiles chain into cascades, and tapping one next to another **fuses**
+  them into a bigger blast.
+- **Obstacles** — 🔒 locked/chained bubbles you free by popping next to them,
+  with dedicated **BREAK** levels.
+- **Varied objectives** — clear N bubbles, collect N of a colour, reach a score,
+  or break all locks. Difficulty, colours and obstacles ramp across **worlds**
+  (each with its own theme), and stars are earned by **score**.
+- **Boosters** — 💣 Bomb, 🌈 Rainbow, 🔨 Hammer, ➕ +5 Moves, 🔀 Shuffle and
+  🔃 Colour-swap, plus a one-step **Undo** and a +5 **continue** on fail.
+- **Juice & smarts** — touch-and-hold previews the group (and the power it would
+  forge); an idle **hint**; an end-of-level **moves-sweep** bonus; "almost there"
+  and low-moves warnings.
+- **Meta** — coins, a shop, daily reward, **star-milestone chests**, per-level
+  best scores, and a stats screen.
+- **Pause & Settings** — sound, haptics and a **colourblind symbol** mode, plus
+  one-time tip cards and a first-level coach.
 - **Endless procedural levels** — difficulty (moves, target, colours) scales
   smoothly across thousands of levels.
 - **Level map** with per-level star ratings (1–3 stars based on efficiency).

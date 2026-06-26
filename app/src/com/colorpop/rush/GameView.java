@@ -121,6 +121,8 @@ public class GameView extends View implements Choreographer.FrameCallback {
     private boolean almostFired, lowMovesFired;
     private String tipText;
     private float tipTimer;
+    private int pendBooster = -1, undoBooster = -1; // booster spent on the move under the undo snapshot
+    private State pauseReturn = State.PLAYING;       // resume into ANIM if paused mid-animation
 
     // Touch tracking
     private float downX, downY, lastY;
@@ -390,6 +392,11 @@ public class GameView extends View implements Choreographer.FrameCallback {
                     && (board.typeAt(bufR, bufC) != Board.T_NORMAL || board.isPoppable(bufR, bufC))) {
                 int r = bufR, c = bufC;
                 bufR = bufC = -1;
+                pendingUndo = board.snapshot();
+                pendMoves = movesLeft;
+                pendScore = score;
+                pendCollected = collected;
+                pendBooster = -1;
                 if (board.typeAt(r, c) != Board.T_NORMAL) {
                     triggerPower(r, c);
                 } else {
@@ -721,8 +728,12 @@ public class GameView extends View implements Choreographer.FrameCallback {
                 board.setLock(r, c, board.lockAt(r, c) - 1);
                 store.addBooster(B_HAMMER, -1);
                 armed = B_NONE;
+                undoSnap = null;       // this mutation bypasses the startClear undo path
+                pendingUndo = null;
                 spawnParticle(colToX(c), rowToY(r), board.colorAt(r, c), dp(260), true);
                 sound.playPop(3);
+                clearHintPreview();
+                checkEndConditions();  // freeing the last lock completes a BREAK level now
                 return;
             }
             cells = new ArrayList<int[]>();
@@ -734,6 +745,7 @@ public class GameView extends View implements Choreographer.FrameCallback {
             return;
         }
         boolean isHammer = armed == B_HAMMER;
+        pendBooster = armed;
         store.addBooster(armed, -1);
         armed = B_NONE;
         startClear(cells, false, isHammer);
@@ -752,6 +764,7 @@ public class GameView extends View implements Choreographer.FrameCallback {
             undoMoves = pendMoves;
             undoScore = pendScore;
             undoCollected = pendCollected;
+            undoBooster = pendBooster;
             pendingUndo = null;
         }
         clearHintPreview();
@@ -2299,7 +2312,7 @@ public class GameView extends View implements Choreographer.FrameCallback {
 
     private void tapPause(float x, float y) {
         if (pauseBtn(0).contains(x, y)) {
-            state = State.PLAYING;
+            state = pauseReturn;
             sound.playClick();
         } else if (pauseBtn(1).contains(x, y)) {
             startGame();
@@ -2391,6 +2404,7 @@ public class GameView extends View implements Choreographer.FrameCallback {
 
     private void tapGame(float x, float y) {
         if (backBtn().contains(x, y)) {
+            pauseReturn = State.PLAYING;
             state = State.PAUSED;
             clearHintPreview();
             sound.playClick();
@@ -2420,6 +2434,7 @@ public class GameView extends View implements Choreographer.FrameCallback {
         pendMoves = movesLeft;
         pendScore = score;
         pendCollected = collected;
+        pendBooster = -1;
         if (armed != B_NONE) {
             applyBooster(cell[0], cell[1]);
         } else if (board.typeAt(cell[0], cell[1]) != Board.T_NORMAL) {
@@ -2443,6 +2458,11 @@ public class GameView extends View implements Choreographer.FrameCallback {
             store.addBooster(B_SWAP, -1);
             armed = B_NONE;
             swapFirst = null;
+            undoSnap = null;       // swap bypasses the startClear undo path
+            pendingUndo = null;
+            if (!board.hasMove()) {
+                board.shuffle();   // never let a swap deadlock the board
+            }
             clearHintPreview();
             floatText("Swapped!", colToX(c), rowToY(r) - BR, dp(16), Palette.COMBO, true);
             sound.playSwoosh();
@@ -2461,6 +2481,10 @@ public class GameView extends View implements Choreographer.FrameCallback {
         score = undoScore;
         displayScore = score;
         collected = undoCollected;
+        if (undoBooster >= 0) {
+            store.addBooster(undoBooster, 1);
+            undoBooster = -1;
+        }
         combo = 0;
         comboTimer = 0f;
         undoSnap = null;
@@ -2495,6 +2519,8 @@ public class GameView extends View implements Choreographer.FrameCallback {
             if (board != null && store.booster(B_SHUFFLE) > 0) {
                 store.addBooster(B_SHUFFLE, -1);
                 board.shuffle();
+                undoSnap = null;
+                pendingUndo = null;
                 clearHintPreview();
                 floatText("Shuffled!", W / 2f, boardY + boardH / 2f, dp(20), Palette.COMBO, true);
                 sound.playSwoosh();
@@ -2612,11 +2638,12 @@ public class GameView extends View implements Choreographer.FrameCallback {
                 return false;
             case PLAYING:
             case ANIM:
+                pauseReturn = state;
                 state = State.PAUSED;
                 clearHintPreview();
                 return true;
             case PAUSED:
-                state = State.PLAYING;
+                state = pauseReturn;
                 return true;
             case SWEEP:
                 finalizeWin();
