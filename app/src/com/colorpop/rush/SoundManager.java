@@ -35,6 +35,7 @@ public class SoundManager {
     private short[] fail;
     private short[] coin;
     private short[] swoosh;
+    private short[] power;
     private short[][] pop; // indexed by combo step
 
     public SoundManager() {
@@ -58,6 +59,7 @@ public class SoundManager {
         win = sequence(new float[]{660f, 880f, 1100f, 1320f}, 0.12f, 0.30f);
         fail = sequence(new float[]{440f, 330f, 247f}, 0.16f, 0.26f);
         swoosh = noiseSweep(0.18f, 0.18f);
+        power = boom();
         pop = new short[10][];
         for (int i = 0; i < pop.length; i++) {
             float base = 520f * (float) Math.pow(1.0595f, i * 2); // rise ~ a tone per combo step
@@ -93,6 +95,10 @@ public class SoundManager {
 
     public void playSwoosh() {
         play(swoosh);
+    }
+
+    public void playPower() {
+        play(power);
     }
 
     // --- Playback ---------------------------------------------------------
@@ -214,6 +220,25 @@ public class SoundManager {
                 out[o++] = (short) (Math.sin(phase) * env * amp * 32767);
                 phase += dp;
             }
+        }
+        return out;
+    }
+
+    /** A low, punchy boom for power-tile detonations. */
+    private static short[] boom() {
+        float seconds = 0.32f;
+        int n = (int) (RATE * seconds);
+        short[] out = new short[n];
+        double phase = 0;
+        java.util.Random rnd = new java.util.Random(3);
+        for (int i = 0; i < n; i++) {
+            float t = (float) i / n;
+            float f = 180f * (1.0f - 0.6f * t);
+            double dp = 2 * Math.PI * f / RATE;
+            float env = (float) Math.pow(1f - t, 1.8f);
+            float noise = (rnd.nextFloat() * 2 - 1) * (1f - t) * 0.4f;
+            out[i] = (short) ((Math.sin(phase) * 0.6f + noise) * env * 0.5f * 32767);
+            phase += dp;
         }
         return out;
     }

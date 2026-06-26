@@ -29,7 +29,7 @@ import java.util.Random;
  */
 public class GameView extends View implements Choreographer.FrameCallback {
 
-    private enum State { MENU, MAP, PREGAME, PLAYING, ANIM, COMPLETE, FAILED, DAILY, STATS, PAUSED, SETTINGS }
+    private enum State { MENU, MAP, PREGAME, PLAYING, ANIM, COMPLETE, FAILED, DAILY, STATS, PAUSED, SETTINGS, SWEEP }
 
     // Booster ids (match Storage booster ids).
     private static final int B_NONE = -1, B_BOMB = 0, B_RAINBOW = 1, B_HAMMER = 2, B_MOVES = 3,
@@ -114,6 +114,13 @@ public class GameView extends View implements Choreographer.FrameCallback {
     private int undoMoves, undoScore, undoCollected;
     private int pendMoves, pendScore, pendCollected;
     private int[] swapFirst; // first cell picked for a swap
+
+    // End-of-level sweep, warnings, tips
+    private int sweepLeft;
+    private float sweepTimer;
+    private boolean almostFired, lowMovesFired;
+    private String tipText;
+    private float tipTimer;
 
     // Touch tracking
     private float downX, downY, lastY;
@@ -348,6 +355,15 @@ public class GameView extends View implements Choreographer.FrameCallback {
         if (state == State.ANIM) {
             advanceAnim(dt);
         }
+        if (state == State.SWEEP) {
+            advanceSweep(dt);
+        }
+        if (tipTimer > 0f) {
+            tipTimer -= dt;
+            if (tipTimer <= 0f) {
+                tipText = null;
+            }
+        }
     }
 
     private void advanceAnim(float dt) {
@@ -452,20 +468,100 @@ public class GameView extends View implements Choreographer.FrameCallback {
         hapticsCache = store.hapticsOn();
         clearHintPreview();
         clearFx();
+        almostFired = false;
+        lowMovesFired = false;
+        tipText = null;
+        if (level.goalType == Level.BREAK) {
+            showTip("break", "BREAK GOAL — free every locked bubble by popping right next to it!");
+        } else if (level.lockCount > 0) {
+            showTip("lock", "Locked bubbles cannot pop. Clear next to them to break the chains!");
+        }
         state = State.PLAYING;
         transFade = 0f;
         sound.playSwoosh();
     }
 
+    private void showTip(String key, String text) {
+        if (store.tipSeen(key)) {
+            return;
+        }
+        store.markTipSeen(key);
+        tipText = text;
+        tipTimer = 5.5f;
+    }
+
+    private void checkWarnings() {
+        int gp = goalProgress();
+        if (!almostFired && target > 0 && gp >= target * 0.8f && gp < target) {
+            almostFired = true;
+            floatText("Almost there!", W / 2f, boardY + boardH * 0.5f, dp(18), Palette.GREEN, true);
+            sound.playCoin();
+        }
+        if (!lowMovesFired && movesLeft <= 3 && movesLeft > 0) {
+            lowMovesFired = true;
+            floatText("Low on moves!", W / 2f, boardY - dp(6), dp(16), Palette.RED, true);
+            sound.playFail();
+        }
+    }
+
     private void win() {
+        // Toon-Blast-style finisher: spend leftover moves on a bonus sweep first.
+        if (movesLeft > 0) {
+            sweepLeft = movesLeft;
+            sweepTimer = 0f;
+            tipText = null;
+            state = State.SWEEP;
+        } else {
+            finalizeWin();
+        }
+    }
+
+    private void advanceSweep(float dt) {
+        sweepTimer += dt;
+        if (sweepTimer < 0.11f) {
+            return;
+        }
+        sweepTimer = 0f;
+        if (sweepLeft <= 0 || board == null) {
+            finalizeWin();
+            return;
+        }
+        sweepLeft--;
+        movesLeft = sweepLeft;
+        int[] t = board.randomDetonateTarget(rng);
+        if (t == null) {
+            finalizeWin();
+            return;
+        }
+        int[] kinds = {Board.T_ROCKET_H, Board.T_ROCKET_V, Board.T_BOMB};
+        board.setType(t[0], t[1], kinds[rng.nextInt(kinds.length)]);
+        List<int[]> seed = new ArrayList<int[]>();
+        seed.add(t);
+        List<int[]> cl = expandCascade(seed);
+        for (int[] cc : cl) {
+            spawnParticle(colToX(cc[1]), rowToY(cc[0]), rng.nextInt(Palette.BUBBLE.length), dp(340), true);
+            board.clearCell(cc[0], cc[1]);
+        }
+        board.damageLocksAround(cl);
+        board.collapse();
+        int bonus = Level.popScore(Math.max(2, cl.size())) + 50;
+        score += bonus;
+        floatText("+" + bonus, colToX(t[1]), rowToY(t[0]) - BR, dp(16), Palette.GOLD, true);
+        comboFlash = 1f;
+        sound.playPower();
+    }
+
+    private void finalizeWin() {
+        movesLeft = 0;
         resultStars = level.starsForScore(score, true);
         resultCoins = Level.coinReward(score, resultStars);
         store.recordResult(selectedLevel, resultStars);
         store.addCoins(resultCoins);
         store.submitScore(score);
+        store.submitLevelScore(selectedLevel, score);
         resultBooster = -1;
         if (selectedLevel % 5 == 0) {
-            resultBooster = rng.nextInt(4);
+            resultBooster = rng.nextInt(BOOSTER_COUNT);
             store.addBooster(resultBooster, 1);
         }
         resultT = 0;
@@ -506,6 +602,7 @@ public class GameView extends View implements Choreographer.FrameCallback {
                 }
             }
             floatText(powerName(powerType) + "!", colToX(c), rowToY(r) - BR, dp(17), Palette.COMBO, true);
+            showTip("power", "Big match! You forged a power bubble — tap it to blast the board.");
             startClear(clearList, true, false);
         } else {
             startClear(g, true, false);
@@ -514,6 +611,7 @@ public class GameView extends View implements Choreographer.FrameCallback {
 
     /** Tapping a power tile detonates it; if it touches another power tile they FUSE. */
     private void triggerPower(int r, int c) {
+        sound.playPower();
         final int[] dr = {-1, 1, 0, 0}, dc = {0, 0, -1, 1};
         for (int i = 0; i < 4; i++) {
             int nr = r + dr[i], nc = c + dc[i];
@@ -726,6 +824,7 @@ public class GameView extends View implements Choreographer.FrameCallback {
                 comboFlash = 1f;
             }
         }
+        checkWarnings();
         sound.playPop(combo);
         if (hapticsCache) {
             try {
@@ -788,6 +887,7 @@ public class GameView extends View implements Choreographer.FrameCallback {
                 case FAILED: drawGame(canvas); drawFailed(canvas); break;
                 case DAILY: drawDaily(canvas); break;
                 case STATS: drawStats(canvas); break;
+                case SWEEP: drawGame(canvas); break;
                 case PAUSED: drawGame(canvas); drawPause(canvas); break;
                 case SETTINGS: drawSettings(canvas); break;
             }
@@ -1013,7 +1113,9 @@ public class GameView extends View implements Choreographer.FrameCallback {
         RectF card = pregameCard();
         drawPanel(canvas, card, dp(28));
 
-        text(canvas, "LEVEL " + selectedLevel, W / 2f, card.top + dp(56), dp(34), Palette.TEXT, true, Paint.Align.CENTER);
+        text(canvas, "LEVEL " + selectedLevel, W / 2f, card.top + dp(54), dp(32), Palette.TEXT, true, Paint.Align.CENTER);
+        text(canvas, World.forLevel(selectedLevel).name, W / 2f, card.top + dp(80), dp(13),
+                Palette.withAlpha(worldAccent, 235), true, Paint.Align.CENTER);
         text(canvas, "GOAL", W / 2f, card.top + dp(104), dp(14), Palette.TEXT_DIM, true, Paint.Align.CENTER);
         float gy = card.top + dp(150);
         if (level.goalType == Level.BREAK) {
@@ -1029,6 +1131,10 @@ public class GameView extends View implements Choreographer.FrameCallback {
         }
         text(canvas, "Moves: " + level.moves + "      Colors: " + level.numColors,
                 W / 2f, gy + dp(46), dp(15), Palette.TEXT_DIM, false, Paint.Align.CENTER);
+        int lb = store.levelBest(selectedLevel);
+        if (lb > 0) {
+            text(canvas, "Best: " + comma(lb), W / 2f, gy + dp(70), dp(14), Palette.GOLD, true, Paint.Align.CENTER);
+        }
 
         text(canvas, "BOOSTERS  (tap to buy)", W / 2f, card.top + card.height() * 0.50f, dp(13),
                 Palette.TEXT_DIM, true, Paint.Align.CENTER);
@@ -1096,6 +1202,22 @@ public class GameView extends View implements Choreographer.FrameCallback {
         // SCORE — auto-shrinks to fit its pill
         text(canvas, "SCORE", sPill.centerX(), lY, dp(12), Palette.TEXT_DIM, true, Paint.Align.CENTER);
         textFit(canvas, comma((int) displayScore), sPill.centerX(), vY, dp(22), pw - dp(16), Palette.GOLD, Paint.Align.CENTER);
+        // Warnings: pulse the relevant pill.
+        float warn = 0.5f + 0.5f * (float) Math.sin(hintPulse * 6f);
+        if (movesLeft <= 3 && movesLeft > 0) {
+            p.setStyle(Paint.Style.STROKE);
+            p.setStrokeWidth(dp(2.5f));
+            p.setColor(Palette.withAlpha(Palette.RED, (int) (90 + 110 * warn)));
+            canvas.drawRoundRect(mPill, dp(14), dp(14), p);
+            p.setStyle(Paint.Style.FILL);
+        }
+        if (target > 0 && goalProgress() >= target * 0.8f && goalProgress() < target) {
+            p.setStyle(Paint.Style.STROKE);
+            p.setStrokeWidth(dp(2.5f));
+            p.setColor(Palette.withAlpha(Palette.GREEN, (int) (90 + 110 * warn)));
+            canvas.drawRoundRect(gPill, dp(14), dp(14), p);
+            p.setStyle(Paint.Style.FILL);
+        }
 
         drawBoard(canvas);
 
@@ -1128,6 +1250,19 @@ public class GameView extends View implements Choreographer.FrameCallback {
         } else if (selectedLevel == 1 && !firstPopDone) {
             text(canvas, "Tap 2+ touching same-colour bubbles!", W / 2f, boardY - dp(34), dp(15),
                     Palette.COMBO, true, Paint.Align.CENTER);
+        }
+        if (tipText != null) {
+            RectF tb = new RectF(W * 0.07f, boardY - dp(58), W * 0.93f, boardY - dp(14));
+            p.setStyle(Paint.Style.FILL);
+            p.setColor(0xE61C1140);
+            canvas.drawRoundRect(tb, dp(14), dp(14), p);
+            p.setStyle(Paint.Style.STROKE);
+            p.setStrokeWidth(dp(1.5f));
+            p.setColor(Palette.withAlpha(worldAccent, 180));
+            canvas.drawRoundRect(tb, dp(14), dp(14), p);
+            p.setStyle(Paint.Style.FILL);
+            textFit(canvas, tipText, tb.centerX(), tb.centerY() + dp(5), dp(13), tb.width() - dp(24),
+                    Palette.TEXT, Paint.Align.CENTER);
         }
     }
 
@@ -1436,6 +1571,13 @@ public class GameView extends View implements Choreographer.FrameCallback {
             ry += dp(50);
         }
 
+        int nextChest = store.claimedChests();
+        text(canvas, "Chest " + (nextChest + 1) + ":  " + store.chestStars(nextChest) + "★  →  "
+                        + comma(store.chestCoins(nextChest)) + " coins", W / 2f, H * 0.8f - dp(150), dp(13),
+                Palette.TEXT_DIM, false, Paint.Align.CENTER);
+        if (store.claimableChest() >= 0) {
+            drawButton(canvas, statsChest(), "CLAIM CHEST", Palette.GOLD, Palette.GOLD_DK, dp(16));
+        }
         drawButton(canvas, statsReset(), resetArmed ? "TAP AGAIN TO CONFIRM" : "RESET PROGRESS",
                 resetArmed ? Palette.RED_DK : Palette.RED, Palette.scale(Palette.RED_DK, 0.85f), dp(16));
         RectF back = backBtn();
@@ -2061,6 +2203,11 @@ public class GameView extends View implements Choreographer.FrameCallback {
         return new RectF((W - w) / 2f, H * 0.8f - dp(70), (W + w) / 2f, H * 0.8f - dp(70) + dp(52));
     }
 
+    private RectF statsChest() {
+        float w = W * 0.5f;
+        return new RectF((W - w) / 2f, H * 0.8f - dp(128), (W + w) / 2f, H * 0.8f - dp(128) + dp(48));
+    }
+
     // ===================================================================
     //  Input
     // ===================================================================
@@ -2429,6 +2576,14 @@ public class GameView extends View implements Choreographer.FrameCallback {
     }
 
     private void tapStats(float x, float y) {
+        if (store.claimableChest() >= 0 && statsChest().contains(x, y)) {
+            int coins = store.chestCoins(store.claimedChests());
+            store.claimChest();
+            store.addCoins(coins);
+            floatText("+" + comma(coins), W / 2f, H * 0.5f, dp(26), Palette.GOLD, true);
+            sound.playCoin();
+            return;
+        }
         if (statsReset().contains(x, y)) {
             if (resetArmed) {
                 store.resetAll();
@@ -2462,6 +2617,9 @@ public class GameView extends View implements Choreographer.FrameCallback {
                 return true;
             case PAUSED:
                 state = State.PLAYING;
+                return true;
+            case SWEEP:
+                finalizeWin();
                 return true;
             case SETTINGS:
                 state = settingsReturn;
