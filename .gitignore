@@ -1,5 +1,6 @@
 # Build artifacts
 /build/
+/runtime-test/.build/
 *.class
 *.apk.idsig
 

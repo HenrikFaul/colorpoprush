@@ -61,6 +61,24 @@ build.sh                       # offline APK build pipeline
 `Board` and `Level` carry no Android dependencies and are unit-tested on the
 plain JVM.
 
+## Verifying it actually runs
+
+Beyond unit-testing the logic, [`runtime-test/`](runtime-test/) executes the
+**real** game code (the exact `GameView`/`Board`/`Level`/… that ship in the
+APK) on a plain JVM against a hand-built Android shim, driving it through the
+same entry points a device uses (`layout`/`attach`/`onTouchEvent`/
+`Choreographer.doFrame`/`draw`/`onBack`) across **every screen and full
+playthroughs** — boosters, power tiles, fusion, locked-bubble/BREAK levels,
+undo, swap, pause, the moves-sweep, a natural win and forced fails. The shim
+reproduces Android's crash-class behaviour (illegal shader radius, NaN draw
+coords, null draw args) and records anything GameView would otherwise swallow,
+so the run asserts **zero runtime faults**:
+
+```bash
+./runtime-test/run.sh
+# -> RESULT: PASS — game ran cleanly across every screen and full playthroughs, zero faults.
+```
+
 ## Building
 
 The build uses only the Debian/Ubuntu Android packages — **no Android Gradle
