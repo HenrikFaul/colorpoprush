@@ -714,6 +714,8 @@ public class GameView extends View implements Choreographer.FrameCallback {
         drawRoundIcon(canvas, pause, Palette.CARD, Palette.CARD_EDGE);
         drawPauseIcon(canvas, pause.centerX(), pause.centerY(), dp(11));
         drawTopCoins(canvas);
+        // Current level shown top-centre (matches the design sheet's "LEVEL 48").
+        text(canvas, "LEVEL " + selectedLevel, W / 2f, dp(35), dp(17), Palette.TEXT, true, Paint.Align.CENTER);
 
         // Stat row sits BELOW the coin pill and pause button to avoid overlap.
         float labelY = H * 0.115f;
@@ -1044,12 +1046,10 @@ public class GameView extends View implements Choreographer.FrameCallback {
         p.setStyle(Paint.Style.FILL);
         p.setColor(edge);
         canvas.drawRoundRect(new RectF(r.left, r.top + dp(5), r.right, r.bottom + dp(5)), radius, radius, p);
-        // glossy vertical face
-        p.setShader(new LinearGradient(0, r.top, 0, r.bottom,
-                Palette.lighten(fill, 0.22f), Palette.scale(fill, 0.92f), Shader.TileMode.CLAMP));
+        // Solid candy face + cheap top sheen (no per-frame shader allocation).
+        p.setColor(fill);
         canvas.drawRoundRect(r, radius, radius, p);
-        p.setShader(null);
-        p.setColor(Palette.withAlpha(0xFFFFFFFF, 55));
+        p.setColor(Palette.withAlpha(0xFFFFFFFF, 60));
         canvas.drawRoundRect(new RectF(r.left + dp(6), r.top + dp(5), r.right - dp(6), r.top + r.height() * 0.44f),
                 radius * 0.6f, radius * 0.6f, p);
         text(canvas, label, r.centerX(), r.centerY() + textSize * 0.36f, textSize, Palette.TEXT, true, Paint.Align.CENTER);
@@ -1321,27 +1321,27 @@ public class GameView extends View implements Choreographer.FrameCallback {
 
     private RectF completeNext() {
         float w = W * 0.5f;
-        return new RectF((W - w) / 2f, H * 0.8f - dp(72), (W + w) / 2f, H * 0.8f - dp(72) + dp(58));
+        return new RectF((W - w) / 2f, H * 0.8f - dp(132), (W + w) / 2f, H * 0.8f - dp(132) + dp(58));
     }
 
     private RectF completeHome() {
         float w = W * 0.34f;
-        return new RectF((W - w) / 2f, H * 0.8f - dp(8), (W + w) / 2f, H * 0.8f - dp(8) + dp(44));
+        return new RectF((W - w) / 2f, H * 0.8f - dp(64), (W + w) / 2f, H * 0.8f - dp(64) + dp(44));
     }
 
     private RectF failedContinue() {
         float w = W * 0.6f;
-        return new RectF((W - w) / 2f, H * 0.78f - dp(140), (W + w) / 2f, H * 0.78f - dp(140) + dp(52));
+        return new RectF((W - w) / 2f, H * 0.78f - dp(186), (W + w) / 2f, H * 0.78f - dp(186) + dp(50));
     }
 
     private RectF failedRetry() {
         float w = W * 0.5f;
-        return new RectF((W - w) / 2f, H * 0.78f - dp(74), (W + w) / 2f, H * 0.78f - dp(74) + dp(56));
+        return new RectF((W - w) / 2f, H * 0.78f - dp(122), (W + w) / 2f, H * 0.78f - dp(122) + dp(52));
     }
 
     private RectF failedHome() {
         float w = W * 0.34f;
-        return new RectF((W - w) / 2f, H * 0.78f - dp(10), (W + w) / 2f, H * 0.78f - dp(10) + dp(42));
+        return new RectF((W - w) / 2f, H * 0.78f - dp(60), (W + w) / 2f, H * 0.78f - dp(60) + dp(44));
     }
 
     private RectF dailyClaim() {
