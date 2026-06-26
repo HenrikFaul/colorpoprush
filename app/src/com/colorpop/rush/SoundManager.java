@@ -6,6 +6,9 @@ import android.media.AudioTrack;
 import android.os.Handler;
 import android.os.HandlerThread;
 
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -24,6 +27,7 @@ public class SoundManager {
     private boolean enabled = true;
     private volatile boolean released = false;
     private final AtomicInteger active = new AtomicInteger(0);
+    private final Set<AudioTrack> live = Collections.synchronizedSet(new HashSet<AudioTrack>());
 
     // Pre-rendered clips.
     private short[] click;
@@ -121,6 +125,7 @@ public class SoundManager {
                             return;
                         }
                         active.incrementAndGet();
+                        live.add(track);
                         track.write(data, 0, data.length);
                         track.play();
                         // Guaranteed teardown: never rely on the marker callback (it may
@@ -129,6 +134,7 @@ public class SoundManager {
                         handler.postDelayed(new Runnable() {
                             @Override
                             public void run() {
+                                live.remove(track);
                                 try { track.stop(); } catch (Throwable ignored) {}
                                 try { track.release(); } catch (Throwable ignored) {}
                                 active.decrementAndGet();
@@ -146,6 +152,15 @@ public class SoundManager {
 
     public void release() {
         released = true;
+        // Release any still-playing tracks now; postDelayed teardowns won't run
+        // once the looper quits, so drain explicitly to avoid leaking native tracks.
+        synchronized (live) {
+            for (AudioTrack t : live) {
+                try { t.stop(); } catch (Throwable ignored) {}
+                try { t.release(); } catch (Throwable ignored) {}
+            }
+            live.clear();
+        }
         try {
             if (thread != null) {
                 thread.quitSafely();

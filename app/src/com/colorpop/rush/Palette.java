@@ -42,12 +42,13 @@ public final class Palette {
     public static final int GOLD = 0xFFFFC83D;
     public static final int GOLD_DK = 0xFFE0A21E;
     public static final int STAR_ON = 0xFFFFD23F;
-    public static final int STAR_OFF = 0xFF4A3F7A;
+    public static final int STAR_OFF = 0xFF6E61A6; // brighter so empty stars stay visible
     public static final int COMBO = 0xFFFFE14D;
+    public static final int COMBO_HOT = 0xFFFF8A3D; // celebratory peak (not danger-red)
 
     // Text
     public static final int TEXT = 0xFFFFFFFF;
-    public static final int TEXT_DIM = 0xFFB9AEE8;
+    public static final int TEXT_DIM = 0xFFDED7FA; // brightened for contrast on the vivid bg
 
     /** Per-letter colours for the COLOR POP RUSH wordmark. */
     public static final int[] LOGO = {
