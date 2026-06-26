@@ -32,10 +32,11 @@ public class GameView extends View implements Choreographer.FrameCallback {
     private enum State { MENU, MAP, PREGAME, PLAYING, ANIM, COMPLETE, FAILED, DAILY, STATS, PAUSED, SETTINGS }
 
     // Booster ids (match Storage booster ids).
-    private static final int B_NONE = -1, B_BOMB = 0, B_RAINBOW = 1, B_HAMMER = 2, B_MOVES = 3, B_SHUFFLE = 4;
-    private static final int BOOSTER_COUNT = 5;
-    private static final String[] B_NAMES = {"BOMB", "COLOR", "HAMMER", "+5", "MIX"};
-    private static final int[] B_PRICE = {120, 150, 100, 80, 90};
+    private static final int B_NONE = -1, B_BOMB = 0, B_RAINBOW = 1, B_HAMMER = 2, B_MOVES = 3,
+            B_SHUFFLE = 4, B_SWAP = 5;
+    private static final int BOOSTER_COUNT = 6;
+    private static final String[] B_NAMES = {"BOMB", "COLOR", "HAMMER", "+5", "MIX", "SWAP"};
+    private static final int[] B_PRICE = {120, 150, 100, 80, 90, 110};
 
     private static final float COMBO_WINDOW = 2.4f;
     private static final float POP_DUR = 0.13f;
@@ -104,6 +105,15 @@ public class GameView extends View implements Choreographer.FrameCallback {
     private boolean symbolsCache, hapticsCache;
     private State settingsReturn = State.MENU;
     private boolean firstPopDone; // level-1 coach prompt
+
+    // World theme (cosmetic, per 20-level band)
+    private int worldBgTop = Palette.BG_TOP, worldBgBottom = Palette.BG_BOTTOM, worldAccent = Palette.GOLD;
+
+    // Undo (one-step) + Colour-swap
+    private Board.Snapshot undoSnap, pendingUndo;
+    private int undoMoves, undoScore, undoCollected;
+    private int pendMoves, pendScore, pendCollected;
+    private int[] swapFirst; // first cell picked for a swap
 
     // Touch tracking
     private float downX, downY, lastY;
@@ -206,11 +216,20 @@ public class GameView extends View implements Choreographer.FrameCallback {
         }
         W = w;
         H = h;
-        bgPaint = new Paint();
-        bgPaint.setShader(new LinearGradient(0, 0, 0, h,
-                Palette.BG_TOP, Palette.BG_BOTTOM, Shader.TileMode.CLAMP));
+        applyWorldTheme(selectedLevel);
         layoutBoard();
         initBgBubbles();
+    }
+
+    private void applyWorldTheme(int lvl) {
+        World wd = World.forLevel(Math.max(1, lvl));
+        worldBgTop = wd.bgTop;
+        worldBgBottom = wd.bgBottom;
+        worldAccent = wd.accent;
+        if (W > 0 && H > 0) {
+            bgPaint = new Paint();
+            bgPaint.setShader(new LinearGradient(0, 0, 0, H, worldBgTop, worldBgBottom, Shader.TileMode.CLAMP));
+        }
     }
 
     private void layoutBoard() {
@@ -337,6 +356,10 @@ public class GameView extends View implements Choreographer.FrameCallback {
             for (int[] cellPos : popping) {
                 board.clearCell(cellPos[0], cellPos[1]);
             }
+            List<int[]> freed = board.damageLocksAround(popping);
+            for (int[] f : freed) {
+                spawnParticle(colToX(f[1]), rowToY(f[0]), board.colorAt(f[0], f[1]), dp(280), true);
+            }
             board.collapse();
             sound.playSwoosh();
             animPhase = 1;
@@ -363,12 +386,30 @@ public class GameView extends View implements Choreographer.FrameCallback {
     }
 
     private void checkEndConditions() {
-        boolean done = (level.goalType == Level.REACH_SCORE) ? (score >= target) : (collected >= target);
+        boolean done;
+        if (level.goalType == Level.BREAK) {
+            done = board.lockedRemaining() == 0;
+        } else if (level.goalType == Level.REACH_SCORE) {
+            done = score >= target;
+        } else {
+            done = collected >= target;
+        }
         if (done) {
             win();
         } else if (movesLeft <= 0) {
             lose();
         }
+    }
+
+    /** Live goal progress for HUD/result readouts. */
+    private int goalProgress() {
+        if (level.goalType == Level.BREAK) {
+            return Math.max(0, target - board.lockLevelsRemaining());
+        }
+        if (level.goalType == Level.REACH_SCORE) {
+            return score;
+        }
+        return collected;
     }
 
     // ===================================================================
@@ -378,6 +419,7 @@ public class GameView extends View implements Choreographer.FrameCallback {
     private void startPregame(int lvl) {
         selectedLevel = Math.max(1, lvl);
         level = new Level(selectedLevel);
+        applyWorldTheme(selectedLevel);
         layoutBoard();
         clearFx();
         state = State.PREGAME;
@@ -387,8 +429,12 @@ public class GameView extends View implements Choreographer.FrameCallback {
 
     private void startGame() {
         level = new Level(selectedLevel);
+        applyWorldTheme(selectedLevel);
         layoutBoard();
-        board = new Board(level.cols, level.rows, level.numColors, rng.nextLong());
+        board = new Board(level.cols, level.rows, level.numColors, level.seed());
+        if (level.lockCount > 0) {
+            board.seedLocks(level.lockCount, level.lockMax, new java.util.Random(level.seed() ^ 0x5DEECE66DL));
+        }
         score = 0;
         displayScore = 0;
         movesLeft = level.moves;
@@ -398,6 +444,9 @@ public class GameView extends View implements Choreographer.FrameCallback {
         armed = B_NONE;
         bufR = bufC = -1;
         pendingSpawn = null;
+        undoSnap = null;
+        pendingUndo = null;
+        swapFirst = null;
         firstPopDone = false;
         symbolsCache = store.symbolsOn();
         hapticsCache = store.hapticsOn();
@@ -463,11 +512,37 @@ public class GameView extends View implements Choreographer.FrameCallback {
         }
     }
 
-    /** Tapping a power tile detonates it (and chains into any power tiles it hits). */
+    /** Tapping a power tile detonates it; if it touches another power tile they FUSE. */
     private void triggerPower(int r, int c) {
+        final int[] dr = {-1, 1, 0, 0}, dc = {0, 0, -1, 1};
+        for (int i = 0; i < 4; i++) {
+            int nr = r + dr[i], nc = c + dc[i];
+            if (board.typeAt(nr, nc) != Board.T_NORMAL && board.colorAt(nr, nc) != Board.EMPTY
+                    && !board.isLocked(nr, nc)) {
+                List<int[]> fused = board.cellsForFusion(r, c, nr, nc);
+                addIfPlayable(fused, r, c);
+                addIfPlayable(fused, nr, nc);
+                floatText("FUSION!", colToX(c), rowToY(r) - BR, dp(20), Palette.COMBO_HOT, true);
+                comboFlash = 1f;
+                startClear(fused, true, false);
+                return;
+            }
+        }
         List<int[]> seed = new ArrayList<int[]>();
         seed.add(new int[]{r, c});
         startClear(seed, true, false);
+    }
+
+    private void addIfPlayable(List<int[]> list, int r, int c) {
+        if (!board.isPlayable(r, c)) {
+            return;
+        }
+        for (int[] cell : list) {
+            if (cell[0] == r && cell[1] == c) {
+                return;
+            }
+        }
+        list.add(new int[]{r, c});
     }
 
     private static String powerName(int type) {
@@ -543,7 +618,15 @@ public class GameView extends View implements Choreographer.FrameCallback {
             cells = board.cellsInBlast(r, c, 2); // 5x5 — a meaningfully "large area"
         } else if (armed == B_RAINBOW) {
             cells = board.cellsOfColor(board.colorAt(r, c));
-        } else {
+        } else { // hammer
+            if (board.isLocked(r, c)) {
+                board.setLock(r, c, board.lockAt(r, c) - 1);
+                store.addBooster(B_HAMMER, -1);
+                armed = B_NONE;
+                spawnParticle(colToX(c), rowToY(r), board.colorAt(r, c), dp(260), true);
+                sound.playPop(3);
+                return;
+            }
             cells = new ArrayList<int[]>();
             cells.add(new int[]{r, c});
         }
@@ -565,13 +648,29 @@ public class GameView extends View implements Choreographer.FrameCallback {
         if (n == 0) {
             return;
         }
+        // Commit the pre-move snapshot for one-step Undo.
+        if (pendingUndo != null) {
+            undoSnap = pendingUndo;
+            undoMoves = pendMoves;
+            undoScore = pendScore;
+            undoCollected = pendCollected;
+            pendingUndo = null;
+        }
         clearHintPreview();
         if (!singleHammer) {
             combo = Math.min(10, combo + 1);
             comboTimer = COMBO_WINDOW;
         }
         int mult = Math.max(1, combo);
-        int gained = singleHammer ? 15 : Level.popScore(Math.max(2, n)) * mult;
+        // Chain multiplier: clearing through power tiles escalates the score.
+        int powerHits = 0;
+        for (int[] pos : cells) {
+            if (board.typeAt(pos[0], pos[1]) != Board.T_NORMAL) {
+                powerHits++;
+            }
+        }
+        float chainMult = 1f + powerHits * 0.5f;
+        int gained = singleHammer ? 15 : (int) (Level.popScore(Math.max(2, n)) * mult * chainMult);
         score += gained;
         if (costsMove) {
             movesLeft--;
@@ -917,7 +1016,10 @@ public class GameView extends View implements Choreographer.FrameCallback {
         text(canvas, "LEVEL " + selectedLevel, W / 2f, card.top + dp(56), dp(34), Palette.TEXT, true, Paint.Align.CENTER);
         text(canvas, "GOAL", W / 2f, card.top + dp(104), dp(14), Palette.TEXT_DIM, true, Paint.Align.CENTER);
         float gy = card.top + dp(150);
-        if (level.goalType == Level.REACH_SCORE) {
+        if (level.goalType == Level.BREAK) {
+            drawLockIcon(canvas, W / 2f - dp(52), gy, dp(18));
+            text(canvas, "Free " + level.lockCount + " locks", W / 2f + dp(28), gy + dp(10), dp(24), Palette.TEXT, true, Paint.Align.CENTER);
+        } else if (level.goalType == Level.REACH_SCORE) {
             drawStar(canvas, W / 2f - dp(52), gy, dp(22), Palette.STAR_ON);
             text(canvas, "Score " + level.target, W / 2f + dp(36), gy + dp(10), dp(26), Palette.TEXT, true, Paint.Align.CENTER);
         } else {
@@ -952,6 +1054,11 @@ public class GameView extends View implements Choreographer.FrameCallback {
         drawRoundIcon(canvas, pause, Palette.CARD, Palette.CARD_EDGE);
         drawPauseIcon(canvas, pause.centerX(), pause.centerY(), dp(11));
         drawTopCoins(canvas);
+        if (undoSnap != null) {
+            RectF ub = undoBtn();
+            drawRoundIcon(canvas, ub, Palette.GOLD, Palette.GOLD_DK);
+            drawUndoIcon(canvas, ub.centerX(), ub.centerY(), dp(12));
+        }
         // Current level shown top-centre (matches the design sheet's "LEVEL 48").
         text(canvas, "LEVEL " + selectedLevel, W / 2f, dp(35), dp(17), Palette.TEXT, true, Paint.Align.CENTER);
 
@@ -971,14 +1078,16 @@ public class GameView extends View implements Choreographer.FrameCallback {
                 movesLeft <= 5 ? Palette.RED : Palette.TEXT, true, Paint.Align.CENTER);
         // GOAL — icon + value drawn as one centred unit (no horizontal wobble)
         text(canvas, "GOAL", gPill.centerX(), lY, dp(12), Palette.TEXT_DIM, true, Paint.Align.CENTER);
-        int gp = (level.goalType == Level.REACH_SCORE) ? score : collected;
+        int gp = goalProgress();
         boolean gdone = gp >= target;
         String gv = Math.min(gp, target) + "/" + target;
         tp.setFakeBoldText(true);
         tp.setTextSize(dp(22));
         float gvw = tp.measureText(gv);
         float unitW = dp(22) + dp(6) + gvw, ux = gPill.centerX() - unitW / 2f;
-        if (level.goalType == Level.REACH_SCORE) {
+        if (level.goalType == Level.BREAK) {
+            drawLockIcon(canvas, ux + dp(11), vY - dp(6), dp(9));
+        } else if (level.goalType == Level.REACH_SCORE) {
             drawStar(canvas, ux + dp(11), vY - dp(7), dp(11), Palette.STAR_ON);
         } else {
             drawBubble(canvas, ux + dp(11), vY - dp(7), dp(11), level.accentColor, 255);
@@ -1010,7 +1119,10 @@ public class GameView extends View implements Choreographer.FrameCallback {
         }
 
         drawBoosterBar(canvas);
-        if (armed != B_NONE) {
+        if (armed == B_SWAP) {
+            text(canvas, swapFirst == null ? "Tap two bubbles to swap" : "Tap an adjacent bubble",
+                    W / 2f, H - dp(94), dp(14), Palette.COMBO, true, Paint.Align.CENTER);
+        } else if (armed != B_NONE) {
             text(canvas, "Tap a bubble to use booster", W / 2f, H - dp(94), dp(14),
                     Palette.COMBO, true, Paint.Align.CENTER);
         } else if (selectedLevel == 1 && !firstPopDone) {
@@ -1061,6 +1173,17 @@ public class GameView extends View implements Choreographer.FrameCallback {
                 if (tt != Board.T_NORMAL) {
                     drawPowerEmblem(canvas, x, y, tt, 255);
                 }
+                int lk = board.lockAt(r, c);
+                if (lk > 0) {
+                    p.setStyle(Paint.Style.FILL);
+                    p.setColor(0x88000000);
+                    canvas.drawCircle(x, y, BR, p);
+                    drawLockIcon(canvas, x, y, BR * 0.42f);
+                    if (lk > 1) {
+                        text(canvas, Integer.toString(lk), x + BR * 0.55f, y + BR * 0.7f, dp(12),
+                                Palette.TEXT, true, Paint.Align.CENTER);
+                    }
+                }
             }
         }
         // touch-down preview + idle hint highlights
@@ -1080,6 +1203,11 @@ public class GameView extends View implements Choreographer.FrameCallback {
                 text(canvas, lbl, px, py - BR - dp(6), dp(15), Palette.COMBO, true, Paint.Align.CENTER);
             } else if (hintCells != null && !hintCells.isEmpty()) {
                 drawCellHighlight(canvas, hintCells, Palette.withAlpha(0xFFFFFFFF, (int) (60 + 90 * pulse)), 1f + 0.06f * pulse);
+            }
+            if (armed == B_SWAP && swapFirst != null) {
+                List<int[]> one = new ArrayList<int[]>();
+                one.add(swapFirst);
+                drawCellHighlight(canvas, one, Palette.withAlpha(Palette.COMBO, (int) (160 + 80 * pulse)), 1.06f);
             }
         }
         // power-tile forming ring
@@ -1187,9 +1315,11 @@ public class GameView extends View implements Choreographer.FrameCallback {
         RectF card = failedCard();
         drawPanel(canvas, card, dp(28));
         text(canvas, "OUT OF MOVES", W / 2f, card.top + dp(60), dp(28), Palette.RED, true, Paint.Align.CENTER);
-        int gp = (level.goalType == Level.REACH_SCORE) ? score : collected;
+        int gp = goalProgress();
         text(canvas, "You reached", W / 2f, card.top + dp(104), dp(16), Palette.TEXT_DIM, false, Paint.Align.CENTER);
-        if (level.goalType == Level.REACH_SCORE) {
+        if (level.goalType == Level.BREAK) {
+            drawLockIcon(canvas, W / 2f - dp(34), card.top + dp(148), dp(16));
+        } else if (level.goalType == Level.REACH_SCORE) {
             drawStar(canvas, W / 2f - dp(34), card.top + dp(148), dp(18), Palette.STAR_ON);
         } else {
             drawBubble(canvas, W / 2f - dp(34), card.top + dp(148), dp(20), level.accentColor, 255);
@@ -1533,6 +1663,7 @@ public class GameView extends View implements Choreographer.FrameCallback {
             case B_RAINBOW: drawRainbowIcon(canvas, cx, cy, s); break;
             case B_HAMMER: drawHammerIcon(canvas, cx, cy, s); break;
             case B_SHUFFLE: drawShuffleIcon(canvas, cx, cy, s); break;
+            case B_SWAP: drawSwapIcon(canvas, cx, cy, s); break;
             default: drawPlusMovesIcon(canvas, cx, cy, s); break;
         }
         float bx = r.right - dp(4), by = r.top + dp(4);
@@ -1653,6 +1784,32 @@ public class GameView extends View implements Choreographer.FrameCallback {
         // two arrow heads suggesting a swap
         canvas.drawCircle(cx + s * 0.9f, cy - s * 0.5f, dp(2.4f), p);
         canvas.drawCircle(cx - s * 0.9f, cy + s * 0.5f, dp(2.4f), p);
+    }
+
+    private void drawSwapIcon(Canvas canvas, float cx, float cy, float s) {
+        p.setStyle(Paint.Style.STROKE);
+        p.setStrokeWidth(dp(2.2f));
+        p.setStrokeCap(Paint.Cap.ROUND);
+        p.setColor(Palette.TEXT);
+        canvas.drawLine(cx - s, cy - s * 0.5f, cx + s, cy - s * 0.5f, p);
+        canvas.drawLine(cx + s, cy - s * 0.5f, cx + s * 0.4f, cy - s, p);
+        canvas.drawLine(cx + s, cy + s * 0.5f, cx - s, cy + s * 0.5f, p);
+        canvas.drawLine(cx - s, cy + s * 0.5f, cx - s * 0.4f, cy + s, p);
+        p.setStyle(Paint.Style.FILL);
+    }
+
+    private void drawUndoIcon(Canvas canvas, float cx, float cy, float s) {
+        p.setStyle(Paint.Style.STROKE);
+        p.setStrokeWidth(dp(3f));
+        p.setStrokeCap(Paint.Cap.ROUND);
+        p.setColor(Palette.CARD_EDGE);
+        canvas.drawArc(new RectF(cx - s, cy - s, cx + s, cy + s), 110, 230, false, p);
+        p.setStyle(Paint.Style.FILL);
+        canvas.drawCircle(cx - s * 0.85f, cy - s * 0.35f, dp(3f), p);
+        p.setStrokeWidth(dp(3f));
+        p.setStyle(Paint.Style.STROKE);
+        canvas.drawLine(cx - s * 0.85f, cy - s * 0.35f, cx - s * 0.2f, cy - s * 0.7f, p);
+        p.setStyle(Paint.Style.FILL);
     }
 
     /** Small white emblem drawn on a power tile to show its kind. */
@@ -1840,6 +1997,11 @@ public class GameView extends View implements Choreographer.FrameCallback {
 
     private RectF backBtn() {
         return new RectF(dp(16), dp(14), dp(16) + dp(48), dp(14) + dp(48));
+    }
+
+    private RectF undoBtn() {
+        float s = dp(44), x = dp(16) + dp(48) + dp(10);
+        return new RectF(x, dp(16), x + s, dp(16) + s);
     }
 
     private RectF pregamePlay() {
@@ -2087,6 +2249,10 @@ public class GameView extends View implements Choreographer.FrameCallback {
             sound.playClick();
             return;
         }
+        if (undoSnap != null && undoBtn().contains(x, y)) {
+            doUndo();
+            return;
+        }
         RectF[] slots = boosterBar();
         for (int i = 0; i < BOOSTER_COUNT; i++) {
             if (slots[i].contains(x, y)) {
@@ -2095,15 +2261,65 @@ public class GameView extends View implements Choreographer.FrameCallback {
             }
         }
         int[] cell = boardCell(x, y);
-        if (cell != null) {
-            if (armed != B_NONE) {
-                applyBooster(cell[0], cell[1]);
-            } else if (board.typeAt(cell[0], cell[1]) != Board.T_NORMAL) {
-                triggerPower(cell[0], cell[1]);
-            } else {
-                tryPop(cell[0], cell[1]);
-            }
+        if (cell == null) {
+            return;
         }
+        if (armed == B_SWAP) {
+            handleSwapTap(cell[0], cell[1]);
+            return;
+        }
+        // Snapshot before a real board action (committed in startClear if a move happens).
+        pendingUndo = board.snapshot();
+        pendMoves = movesLeft;
+        pendScore = score;
+        pendCollected = collected;
+        if (armed != B_NONE) {
+            applyBooster(cell[0], cell[1]);
+        } else if (board.typeAt(cell[0], cell[1]) != Board.T_NORMAL) {
+            triggerPower(cell[0], cell[1]);
+        } else {
+            tryPop(cell[0], cell[1]);
+        }
+    }
+
+    private void handleSwapTap(int r, int c) {
+        if (!board.isPlayable(r, c)) {
+            sound.playClick();
+            return;
+        }
+        if (swapFirst == null) {
+            swapFirst = new int[]{r, c};
+            sound.playClick();
+        } else if (swapFirst[0] == r && swapFirst[1] == c) {
+            swapFirst = null;
+        } else if (board.swap(swapFirst[0], swapFirst[1], r, c)) {
+            store.addBooster(B_SWAP, -1);
+            armed = B_NONE;
+            swapFirst = null;
+            clearHintPreview();
+            floatText("Swapped!", colToX(c), rowToY(r) - BR, dp(16), Palette.COMBO, true);
+            sound.playSwoosh();
+        } else {
+            swapFirst = new int[]{r, c};
+            sound.playClick();
+        }
+    }
+
+    private void doUndo() {
+        if (undoSnap == null || board == null) {
+            return;
+        }
+        board.restore(undoSnap);
+        movesLeft = undoMoves;
+        score = undoScore;
+        displayScore = score;
+        collected = undoCollected;
+        combo = 0;
+        comboTimer = 0f;
+        undoSnap = null;
+        clearHintPreview();
+        floatText("Undo", W / 2f, boardY + boardH / 2f, dp(20), Palette.COMBO, true);
+        sound.playSwoosh();
     }
 
     /** Buffer a board tap made during the pop/fall animation so combos keep flowing. */
@@ -2155,6 +2371,7 @@ public class GameView extends View implements Choreographer.FrameCallback {
         }
         if (store.booster(id) > 0) {
             armed = (armed == id) ? B_NONE : id;
+            swapFirst = null;
             sound.playClick();
         } else {
             floatText("Out of " + B_NAMES[id], W / 2f, boardY + boardH + dp(6), dp(14), Palette.RED, true);

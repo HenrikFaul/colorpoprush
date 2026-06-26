@@ -95,6 +95,54 @@ public class Storage {
         }
     }
 
+    public int levelBest(int level) {
+        return prefs.getInt("best_" + level, 0);
+    }
+
+    public void submitLevelScore(int level, int score) {
+        if (score > levelBest(level)) {
+            prefs.edit().putInt("best_" + level, score).apply();
+        }
+    }
+
+    // --- Star-milestone chests --------------------------------------------
+
+    private static final int[] CHEST_STARS = {10, 25, 50, 100, 175, 275, 400, 550, 750, 1000};
+    private static final int[] CHEST_COINS = {200, 350, 600, 1000, 1600, 2400, 3500, 5000, 7000, 9000};
+
+    public int chestStars(int i) {
+        return i < CHEST_STARS.length ? CHEST_STARS[i]
+                : CHEST_STARS[CHEST_STARS.length - 1] + (i - CHEST_STARS.length + 1) * 350;
+    }
+
+    public int chestCoins(int i) {
+        return i < CHEST_COINS.length ? CHEST_COINS[i] : 9000;
+    }
+
+    public int claimedChests() {
+        return Math.max(0, prefs.getInt("chests", 0));
+    }
+
+    public void claimChest() {
+        prefs.edit().putInt("chests", claimedChests() + 1).apply();
+    }
+
+    /** Index of the next claimable chest if total stars qualify, else -1. */
+    public int claimableChest() {
+        int c = claimedChests();
+        return totalStars() >= chestStars(c) ? c : -1;
+    }
+
+    // --- One-time tips ----------------------------------------------------
+
+    public boolean tipSeen(String key) {
+        return prefs.getBoolean("tip_" + key, false);
+    }
+
+    public void markTipSeen(String key) {
+        prefs.edit().putBoolean("tip_" + key, true).apply();
+    }
+
     public int levelsCleared() {
         return Math.max(0, unlockedLevel() - 1);
     }
