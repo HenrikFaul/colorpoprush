@@ -114,6 +114,23 @@ public class Storage {
         prefs.edit().putBoolean("sound", on).apply();
     }
 
+    public boolean hapticsOn() {
+        return prefs.getBoolean("haptics", true);
+    }
+
+    public void setHapticsOn(boolean on) {
+        prefs.edit().putBoolean("haptics", on).apply();
+    }
+
+    /** Colourblind-friendly: draw a distinct symbol on each bubble colour. */
+    public boolean symbolsOn() {
+        return prefs.getBoolean("symbols", false);
+    }
+
+    public void setSymbolsOn(boolean on) {
+        prefs.edit().putBoolean("symbols", on).apply();
+    }
+
     // --- Daily reward -----------------------------------------------------
 
     public long lastClaimDay() {

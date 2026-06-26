@@ -14,9 +14,16 @@ when you get stuck, and clear the level goal before you run out of moves.
 
 - **One-tap gameplay** — tap connected same-colour bubbles to pop them.
 - **Combos & chains** — keep popping to build a combo multiplier (up to ×10).
-- **Boosters** — 💣 Bomb (5×5 blast), 🌈 Rainbow (clear a whole colour),
-  🔨 Hammer (pop any bubble) and ➕ +5 Moves. Buy more with coins before a level,
-  or use **+5 Moves to continue** when you run out.
+- **Power bubbles** — big matches forge specials that chain into cascades:
+  5+ → 🚀 Rocket (clears a row/column), 7+ → 💣 Bomb (5×5), 9+ → 🌈 Rainbow
+  (clears a colour). Tap to detonate; power tiles trigger each other.
+- **Varied objectives** — clear N bubbles, collect N of a colour, or reach a score.
+- **Boosters** — 💣 Bomb, 🌈 Rainbow, 🔨 Hammer, ➕ +5 Moves and 🔀 Shuffle.
+  Buy more with coins before a level, or **continue with +5 Moves** when you run out.
+- **Smarter play** — touch-and-hold previews the group (and the power it would
+  forge); an idle **hint** pulses a good move; stars are earned by **score**.
+- **Pause menu & Settings** — sound, haptics and a **colourblind symbol** mode;
+  plus a first-level coach.
 - **Endless procedural levels** — difficulty (moves, target, colours) scales
   smoothly across thousands of levels.
 - **Level map** with per-level star ratings (1–3 stars based on efficiency).
